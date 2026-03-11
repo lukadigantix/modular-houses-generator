@@ -560,6 +560,146 @@ export default function Home() {
     setModules(generateLayout(genSmall, genLarge));
   };
 
+  // ---- Export PDF ----
+  const handleExportPDF = () => {
+    if (modules.length === 0) return;
+    let minC = Infinity, minR = Infinity, maxC = -Infinity, maxR = -Infinity;
+    for (const m of modules) {
+      const { w, h } = moduleSize(m);
+      if (m.col < minC) minC = m.col;
+      if (m.row < minR) minR = m.row;
+      if (m.col + w > maxC) maxC = m.col + w;
+      if (m.row + h > maxR) maxR = m.row + h;
+    }
+    const SCALE = 84;
+    const PAD = 40;
+    const svgW = (maxC - minC) * SCALE + PAD * 2;
+    const svgH = (maxR - minR) * SCALE + PAD * 2;
+    // grid lines behind modules
+    const gridLines: string[] = [];
+    for (let c = 0; c <= maxC - minC; c++) {
+      const x = c * SCALE + PAD;
+      gridLines.push(`<line x1="${x}" y1="${PAD}" x2="${x}" y2="${svgH - PAD}" stroke="#e8eaed" stroke-width="0.5"/>`);
+    }
+    for (let r = 0; r <= maxR - minR; r++) {
+      const y = r * SCALE + PAD;
+      gridLines.push(`<line x1="${PAD}" y1="${y}" x2="${svgW - PAD}" y2="${y}" stroke="#e8eaed" stroke-width="0.5"/>`);
+    }
+    const rects = modules.map((m, idx) => {
+      const { w, h } = moduleSize(m);
+      const x = (m.col - minC) * SCALE + PAD;
+      const y = (m.row - minR) * SCALE + PAD;
+      const isSmall = m.type === 'small';
+      const fill    = isSmall ? '#3d3d4a' : '#ffffff';
+      const stroke  = isSmall ? '#2a2a36' : '#c8ccd4';
+      const tc      = isSmall ? '#ffffff' : '#1a1a2e';
+      const tc2     = isSmall ? 'rgba(255,255,255,0.55)' : '#9098a8';
+      const label   = isSmall ? 'MALI' : 'VELIKI';
+      const size    = isSmall ? '2.4 × 2.4 m' : (w === 2 ? '4.8 × 2.4 m' : '2.4 × 4.8 m');
+      const numX    = x + w * SCALE - 10;
+      const numY    = y + 14;
+      const cx      = x + w * SCALE / 2;
+      const cy      = y + h * SCALE / 2;
+      const shadow  = isSmall ? '' : `<rect x="${x+4}" y="${y+4}" width="${w*SCALE-8}" height="${h*SCALE-8}" rx="7" fill="#e4e7ec" opacity="0.6"/>`;
+      return [
+        shadow,
+        `<rect x="${x+2}" y="${y+2}" width="${w*SCALE-4}" height="${h*SCALE-4}" rx="8" fill="${fill}" stroke="${stroke}" stroke-width="1"/>`,
+        `<text x="${numX}" y="${numY}" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" font-weight="500" fill="${tc2}" text-anchor="end">${idx + 1}</text>`,
+        `<text x="${cx}" y="${cy - 6}" font-family="'Inter','Helvetica Neue',sans-serif" font-size="10" font-weight="700" fill="${tc}" text-anchor="middle" letter-spacing="0.06em">${label}</text>`,
+        `<text x="${cx}" y="${cy + 10}" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="${tc2}" text-anchor="middle">${size}</text>`,
+      ].join('');
+    }).join('');
+    // legend
+    const legend = `<g transform="translate(${PAD},${svgH - 18})">
+      <rect x="0" y="-7" width="10" height="10" rx="2" fill="#3d3d4a"/>
+      <text x="14" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Mali (2.4 × 2.4 m)</text>
+      <rect x="130" y="-7" width="10" height="10" rx="2" fill="#ffffff" stroke="#c8ccd4" stroke-width="1"/>
+      <text x="144" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Veliki (4.8 × 2.4 m / 2.4 × 4.8 m)</text>
+    </g>`;
+    const bboxW = bbox ? bbox.w.toFixed(1) : '—';
+    const bboxH = bbox ? bbox.h.toFixed(1) : '—';
+    const date  = new Date().toLocaleDateString('sr-Latn-RS', { year: 'numeric', month: 'long', day: 'numeric' });
+    const refNo = `MH-${new Date().getFullYear()}-${String(modules.length).padStart(3,'0')}`;
+    const totalAreaVal = totalArea.toFixed(2);
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Modular Houses – Layout</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+@page{margin:0}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;color:#1a1a2e;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.page{background:#fff;max-width:860px;margin:0 auto;min-height:100vh}
+/* ── HEADER BAND ── */
+.header-band{background:#0f1724;padding:28px 52px;display:flex;align-items:center;justify-content:space-between}
+.header-band img{height:34px;filter:brightness(0) invert(1)}
+.header-right{text-align:right}
+.header-ref{font-size:9px;letter-spacing:.12em;color:#4a6080;text-transform:uppercase;font-weight:600;margin-bottom:4px}
+.header-date{font-size:13px;color:#c8d8e8;font-weight:500}
+.header-email{font-size:11px;color:#4a6080;margin-top:3px}
+/* ── BODY ── */
+.body{padding:44px 52px 52px}
+/* ── TITLE ROW ── */
+.title-row{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:32px;padding-bottom:20px;border-bottom:2px solid #f0f2f5}
+.doc-title{font-size:22px;font-weight:700;color:#0f1724;letter-spacing:-.02em}
+.doc-sub{font-size:12px;color:#9098a8;font-weight:500;margin-top:4px}
+.badge{background:#f0f4ff;color:#3d5afe;font-size:10px;font-weight:700;letter-spacing:.06em;padding:5px 10px;border-radius:6px;border:1px solid #c8d4fc}
+/* ── STATS ── */
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:36px}
+.stat{background:#f8f9fb;border:1px solid #eaecf0;border-radius:10px;padding:16px 14px;position:relative;overflow:hidden}
+.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:#0f1724;border-radius:10px 10px 0 0}
+.stat-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#9098a8;font-weight:600;margin-bottom:8px}
+.stat-value{font-size:18px;font-weight:700;color:#0f1724;line-height:1}
+.stat-unit{font-size:11px;font-weight:500;color:#9098a8;margin-left:2px}
+/* ── LAYOUT BOX ── */
+.section-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#9098a8;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.section-label::after{content:'';flex:1;height:1px;background:#eaecf0}
+.layout-box{background:#f8f9fb;border:1px solid #eaecf0;border-radius:12px;padding:32px;margin-bottom:36px;display:flex;justify-content:center;align-items:center;overflow:auto}
+/* ── FOOTER ── */
+.footer{margin-top:52px;padding-top:20px;border-top:1px solid #eaecf0;display:flex;justify-content:space-between;align-items:center}
+.footer-left{font-size:10px;color:#c0c8d4}
+.footer-right{font-size:10px;color:#c0c8d4;text-align:right}
+@media print{body{background:#fff}.page{max-width:none}}
+</style>
+</head><body><div class="page">
+<div class="header-band">
+  <img src="${window.location.origin}/modular-dark.png" onerror="this.style.display='none'">
+  <div class="header-right">
+    <div class="header-ref">Ref. ${refNo}</div>
+    <div class="header-date">${date}</div>
+    <div class="header-email">info@modularhouses.rs</div>
+  </div>
+</div>
+<div class="body">
+  <div class="title-row">
+    <div>
+      <div class="doc-title">Specifikacija rasporeda modula</div>
+      <div class="doc-sub">Modular Houses — generisani layout</div>
+    </div>
+    <div class="badge">NACRT / DRAFT</div>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="stat-label">Ukupno modula</div><div class="stat-value">${modules.length}<span class="stat-unit">kom</span></div></div>
+    <div class="stat"><div class="stat-label">Mali moduli</div><div class="stat-value">${smallCount}<span class="stat-unit">mod.</span></div></div>
+    <div class="stat"><div class="stat-label">Veliki moduli</div><div class="stat-value">${largeCount}<span class="stat-unit">mod.</span></div></div>
+    <div class="stat"><div class="stat-label">Gabarit</div><div class="stat-value" style="font-size:14px">${bboxW}<span class="stat-unit">×</span>${bboxH}<span class="stat-unit">m</span></div></div>
+    <div class="stat"><div class="stat-label">Ukupna površina</div><div class="stat-value" style="font-size:16px">${totalAreaVal}<span class="stat-unit">m²</span></div></div>
+  </div>
+  <div class="section-label">Raspored modula</div>
+  <div class="layout-box">
+    <svg width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}" xmlns="http://www.w3.org/2000/svg">
+      ${gridLines.join('')}${rects}${legend}
+    </svg>
+  </div>
+  <div class="footer">
+    <div class="footer-left">Modular Houses d.o.o. · info@modularhouses.rs</div>
+    <div class="footer-right">Dokument generisan automatski — nije zamena za tehnički projekat.</div>
+  </div>
+</div>
+</div><script>window.onload=()=>{window.print()}<\/script></body></html>`;
+    const win = window.open('', '_blank');
+    if (win) { win.document.write(html); win.document.close(); }
+  };
+
   // ---- Scroll 2D to center the generated layout ----
   useEffect(() => {
     if (!needsCenterRef.current || modules.length === 0 || !scrollRef.current) return;
@@ -829,8 +969,34 @@ export default function Home() {
           </button>
         </div>
 
-        {/* ── Right: Delete + Zoom + 2D/3D ── */}
+        {/* ── Right: Export + Delete + Zoom + 2D/3D ── */}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+          {modules.length > 0 && (
+            <button
+              onClick={handleExportPDF}
+              style={{
+                background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 8, padding: '6px 13px',
+                color: 'rgba(255,255,255,0.6)', cursor: 'pointer',
+                fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s', display: 'flex', alignItems: 'center', gap: 5,
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.12)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.06)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.6)';
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" style={{ opacity: 0.7 }}>
+                <path d="M3 4h2V1h6v3h2L8 9 3 4zm-1 8h12v2H2v-2z" fill="currentColor"/>
+              </svg>
+              PDF
+            </button>
+          )}
+
           {modules.length > 0 && (
             <button
               onClick={() => setModules([])}
