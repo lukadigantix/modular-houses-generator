@@ -630,25 +630,25 @@ export default function Home() {
 body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;color:#1a1a2e;-webkit-print-color-adjust:exact;print-color-adjust:exact}
 .page{background:#fff;max-width:860px;margin:0 auto;min-height:100vh}
 /* ── HEADER BAND ── */
-.header-band{background:#0f1724;padding:28px 52px;display:flex;align-items:center;justify-content:space-between}
+.header-band{background:#000000;padding:28px 52px;display:flex;align-items:center;justify-content:space-between}
 .header-band img{height:34px;filter:brightness(0) invert(1)}
 .header-right{text-align:right}
-.header-ref{font-size:9px;letter-spacing:.12em;color:#4a6080;text-transform:uppercase;font-weight:600;margin-bottom:4px}
-.header-date{font-size:13px;color:#c8d8e8;font-weight:500}
-.header-email{font-size:11px;color:#4a6080;margin-top:3px}
+.header-ref{font-size:9px;letter-spacing:.12em;color:#ffffff;text-transform:uppercase;font-weight:600;margin-bottom:4px}
+.header-date{font-size:13px;color:#ffffff;font-weight:700}
+.header-email{font-size:11px;color:#ffffff;margin-top:3px}
 /* ── BODY ── */
 .body{padding:44px 52px 52px}
 /* ── TITLE ROW ── */
 .title-row{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:32px;padding-bottom:20px;border-bottom:2px solid #f0f2f5}
-.doc-title{font-size:22px;font-weight:700;color:#0f1724;letter-spacing:-.02em}
+.doc-title{font-size:22px;font-weight:700;color:#000000;letter-spacing:-.02em}
 .doc-sub{font-size:12px;color:#9098a8;font-weight:500;margin-top:4px}
-.badge{background:#0f1724;color:#ffffff;font-size:10px;font-weight:700;letter-spacing:.06em;padding:5px 10px;border-radius:6px;border:1px solid #1e2d45}
+.badge{background:#000000;color:#ffffff;font-size:10px;font-weight:700;letter-spacing:.06em;padding:5px 10px;border-radius:6px;border:1px solid #333333}
 /* ── STATS ── */
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:36px}
 .stat{background:#f8f9fb;border:1px solid #eaecf0;border-radius:10px;padding:16px 14px;position:relative;overflow:hidden}
-.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:#0f1724;border-radius:10px 10px 0 0}
+.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:#000000;border-radius:10px 10px 0 0}
 .stat-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#9098a8;font-weight:600;margin-bottom:8px}
-.stat-value{font-size:18px;font-weight:700;color:#0f1724;line-height:1}
+.stat-value{font-size:18px;font-weight:700;color:#000000;line-height:1}
 .stat-unit{font-size:11px;font-weight:500;color:#9098a8;margin-left:2px}
 /* ── LAYOUT BOX ── */
 .section-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#9098a8;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
