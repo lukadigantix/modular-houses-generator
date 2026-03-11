@@ -642,7 +642,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
 .title-row{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:32px;padding-bottom:20px;border-bottom:2px solid #f0f2f5}
 .doc-title{font-size:22px;font-weight:700;color:#0f1724;letter-spacing:-.02em}
 .doc-sub{font-size:12px;color:#9098a8;font-weight:500;margin-top:4px}
-.badge{background:#f0f4ff;color:#3d5afe;font-size:10px;font-weight:700;letter-spacing:.06em;padding:5px 10px;border-radius:6px;border:1px solid #c8d4fc}
+.badge{background:#0f1724;color:#ffffff;font-size:10px;font-weight:700;letter-spacing:.06em;padding:5px 10px;border-radius:6px;border:1px solid #1e2d45}
 /* ── STATS ── */
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:36px}
 .stat{background:#f8f9fb;border:1px solid #eaecf0;border-radius:10px;padding:16px 14px;position:relative;overflow:hidden}
