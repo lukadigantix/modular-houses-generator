@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { supabase } from '@/lib/supabase';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
@@ -390,8 +391,8 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
       addQuad(b01, b11, t11, t01);
       addQuad(b00, b01, t01, t00);
       addQuad(b10, b11, t11, t10);
-      // Ceiling panel
-      addQuad(t00, t10, t11, t01);
+      // Ceiling panel — only for small modules (large modules have open roof)
+      if (m.type === 'small') addQuad(t00, t10, t11, t01);
 
       if (m.type === 'small') return;
 
@@ -429,22 +430,20 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
       addMember(eave0,  eave1,  roofMat);
       addMember(ridge0, ridge1, roofMat);
 
-      // End rafters (gable edges)
-      addMember(eave0,  ridge0, roofMat);
-      addMember(eave1,  ridge1, roofMat);
+      // Gable edge rafters (sloped edges of the roof)
+      addMember(eave0, ridge0, roofMat);
+      addMember(eave1, ridge1, roofMat);
 
-      // Mid rafter
-      const eaveMid  = eave0.clone().lerp(eave1,   0.5);
-      const ridgeMid = ridge0.clone().lerp(ridge1,  0.5);
-      addMember(eaveMid, ridgeMid, roofMat);
+      // Ridge-side wall closure — vertical posts + panel bridging wall-top to ridge beam
+      const rBase0 = ridge0.clone().setY(worldH);
+      const rBase1 = ridge1.clone().setY(worldH);
+      addMember(rBase0, ridge0, roofMat);
+      addMember(rBase1, ridge1, roofMat);
+      addQuad(rBase0, rBase1, ridge1, ridge0, panelMat2);
 
-      // Mid-slope purlin (runs parallel to eave/ridge at half-slope height)
-      const midY = worldH + ROOF_RISE / 2;
-      if (!pitchInZ) {
-        addMember(V((x0 + x1) / 2, midY, z0), V((x0 + x1) / 2, midY, z1), roofMat);
-      } else {
-        addMember(V(x0, midY, (z0 + z1) / 2), V(x1, midY, (z0 + z1) / 2), roofMat);
-      }
+      // Gable fill — triangular areas on end-walls above worldH, under the sloped roof
+      addQuad(eave0, rBase0, ridge0, eave0, panelMat2);
+      addQuad(eave1, rBase1, ridge1, eave1, panelMat2);
 
       // Roof fill panel
       const roofPanelMat = new THREE.MeshStandardMaterial({
@@ -558,6 +557,37 @@ export default function Home() {
     if (genSmall === 0 && genLarge === 0) return;
     needsCenterRef.current = true;
     setModules(generateLayout(genSmall, genLarge));
+  };
+
+  // ---- Save layout ----
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
+  const handleSaveLayout = async () => {
+    if (modules.length === 0) return;
+    setSaveStatus('saving');
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { setSaveStatus('error'); return; }
+    const largeCount = modules.filter(m => m.type === 'large').length;
+    const smallCount = modules.filter(m => m.type === 'small').length;
+    const area = modules.reduce((sum, m) => {
+      const { w, h } = moduleSize(m);
+      return sum + w * 2.4 * h * 2.4;
+    }, 0);
+    const { error } = await supabase.from('layouts').insert({
+      user_id: user.id,
+      layout: modules,
+      large_count: largeCount,
+      small_count: smallCount,
+      total_area_m2: parseFloat(area.toFixed(2)),
+    });
+    if (error) { setSaveStatus('error'); setTimeout(() => setSaveStatus('idle'), 3000); }
+    else { setSaveStatus('saved'); setTimeout(() => setSaveStatus('idle'), 2500); }
+  };
+
+  // ---- Logout ----
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    window.location.href = '/login';
   };
 
   // ---- Export PDF ----
@@ -821,6 +851,63 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       className="min-h-screen flex flex-col"
       style={{ background: '#0f0f12', color: '#ffffff', userSelect: 'none' }}
     >
+      <style>{`
+        @keyframes overlay-in { from { opacity: 0 } to { opacity: 1 } }
+        @keyframes card-in { from { opacity: 0; transform: translate(-50%,-50%) scale(0.92) } to { opacity: 1; transform: translate(-50%,-50%) scale(1) } }
+        @keyframes spin { to { transform: rotate(360deg) } }
+        @keyframes check-in { from { opacity:0; transform:scale(0.5) } to { opacity:1; transform:scale(1) } }
+      `}</style>
+
+      {/* ── Save overlay ── */}
+      {(saveStatus === 'saving' || saveStatus === 'saved') && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)',
+          animation: 'overlay-in 0.18s ease',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            position: 'fixed', top: '50%', left: '50%',
+            transform: 'translate(-50%,-50%)',
+            background: '#141418', border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: 20, padding: '36px 48px',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16,
+            animation: 'card-in 0.22s cubic-bezier(0.34,1.56,0.64,1)',
+            minWidth: 240,
+          }}>
+            {saveStatus === 'saving' ? (
+              <>
+                <div style={{
+                  width: 44, height: 44,
+                  border: '3px solid rgba(255,255,255,0.08)',
+                  borderTop: '3px solid rgba(255,255,255,0.7)',
+                  borderRadius: '50%',
+                  animation: 'spin 0.7s linear infinite',
+                }}/>
+                <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 14, margin: 0 }}>Čuvam raspored...</p>
+              </>
+            ) : (
+              <>
+                <div style={{
+                  width: 52, height: 52, borderRadius: '50%',
+                  background: 'rgba(34,197,94,0.15)', border: '1px solid rgba(34,197,94,0.35)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  animation: 'check-in 0.25s cubic-bezier(0.34,1.56,0.64,1)',
+                }}>
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="rgb(134,239,172)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="20 6 9 17 4 12"/>
+                  </svg>
+                </div>
+                <div style={{ textAlign: 'center' }}>
+                  <p style={{ color: '#fff', fontSize: 15, fontWeight: 600, margin: '0 0 4px' }}>Raspored sačuvan</p>
+                  <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, margin: 0 }}>Uspešno dodat u bazu</p>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ── Toolbar ──────────────────────────────────────────────── */}
       <header style={{
         borderBottom: '1px solid rgba(255,255,255,0.06)',
@@ -973,6 +1060,26 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
           {modules.length > 0 && (
             <button
+              onClick={handleSaveLayout}
+              disabled={saveStatus === 'saving'}
+              style={{
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 8, padding: '6px 13px',
+                color: saveStatus === 'error' ? '#f87171' : 'rgba(255,255,255,0.6)',
+                cursor: saveStatus === 'saving' ? 'wait' : 'pointer',
+                fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s', display: 'flex', alignItems: 'center', gap: 5,
+              }}
+              onMouseEnter={e => { if (saveStatus === 'idle') { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; e.currentTarget.style.color = '#fff'; } }}
+              onMouseLeave={e => { if (saveStatus === 'idle') { e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; } }}
+            >
+              {saveStatus === 'error' ? 'Greška' : 'Sačuvaj'}
+            </button>
+          )}
+
+          {modules.length > 0 && (
+            <button
               onClick={handleExportPDF}
               style={{
                 background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)',
@@ -1104,6 +1211,27 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               }}
             >3D</button>
           </div>
+
+          {/* Logout */}
+          <button
+            onClick={handleLogout}
+            title=""
+            style={{
+              height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+              borderRadius: 8, border: '1px solid rgba(220,50,50,0.35)',
+              background: 'rgba(200,30,30,0.15)', color: 'rgba(255,100,100,0.85)',
+              cursor: 'pointer', fontSize: 12, fontWeight: 600, padding: '0 8px',
+              transition: 'all 0.12s', letterSpacing: '0.02em',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(200,30,30,0.28)'; e.currentTarget.style.color = '#ff6b6b'; e.currentTarget.style.borderColor = 'rgba(220,50,50,0.6)'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = 'rgba(200,30,30,0.15)'; e.currentTarget.style.color = 'rgba(255,100,100,0.85)'; e.currentTarget.style.borderColor = 'rgba(220,50,50,0.35)'; }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+          </button>
         </div>
       </header>
 
