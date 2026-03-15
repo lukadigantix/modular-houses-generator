@@ -5,9 +5,8 @@ import { createServerClient } from '@supabase/ssr';
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Allow login page and static assets through
+  // Allow static assets through without any auth check
   if (
-    pathname.startsWith('/login') ||
     pathname.startsWith('/_next') ||
     pathname.startsWith('/favicon') ||
     /\.\w+$/.test(pathname)
@@ -35,7 +34,13 @@ export async function middleware(request: NextRequest) {
 
   const { data: { user } } = await supabase.auth.getUser();
 
-  if (!user) {
+  // Logged-in user trying to access /login → redirect to home
+  if (user && pathname.startsWith('/login')) {
+    return NextResponse.redirect(new URL('/', request.url));
+  }
+
+  // Unauthenticated user trying to access protected routes → redirect to login
+  if (!user && !pathname.startsWith('/login')) {
     return NextResponse.redirect(new URL('/login', request.url));
   }
 

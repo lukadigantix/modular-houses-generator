@@ -18,7 +18,7 @@ const ZOOM_STEP = 0.15;
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-type ModuleType = 'small' | 'large';
+type ModuleType = 'small' | 'large' | 'tall';
 
 interface PlacedModule {
   id:      string;
@@ -43,7 +43,7 @@ interface DragState {
 // Grid helpers
 // ---------------------------------------------------------------------------
 function moduleSize(m: PlacedModule): { w: number; h: number } {
-  if (m.type === 'small') return { w: 1, h: 1 };
+  if (m.type === 'small' || m.type === 'tall') return { w: 1, h: 1 };
   return m.rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 };
 }
 
@@ -97,7 +97,7 @@ function firstFreePosition(
 //     Horizontal chain :  next joint at col ± 3  (leaves 2 cells for HH arm)
 //     Vertical stack   :  next joint at row ± 1  (joints share the same column)
 // ---------------------------------------------------------------------------
-function generateLayout(smallCount: number, largeCount: number): PlacedModule[] {
+function generateLayout(smallCount: number, largeCount: number, tallCount: number): PlacedModule[] {
   const result: PlacedModule[] = [];
 
   const shuffle = <T,>(arr: T[]): T[] => {
@@ -118,25 +118,38 @@ function generateLayout(smallCount: number, largeCount: number): PlacedModule[] 
     });
   };
 
-  // ── PHASE 1: place MALI (ridge joints) ────────────────────────────────────
+  // ── PHASE 1: place joints (tall first, then small) ────────────────────────
+  // Crveni (tall) modules take joint/hub positions; small fill remaining joints.
   const joints: { col: number; row: number }[] = [];
+  let tallLeft  = tallCount;
+  let smallLeft = smallCount;
 
   const tryJoint = (col: number, row: number): boolean => {
     if (!free(col, row, 1, 1)) return false;
     joints.push({ col, row });
-    result.push({ id: crypto.randomUUID(), type: 'small', col, row, rotation: 0 });
+    // Fill with tall first, then small
+    if (tallLeft > 0) {
+      result.push({ id: crypto.randomUUID(), type: 'tall', col, row, rotation: 0 });
+      tallLeft--;
+    } else if (smallLeft > 0) {
+      result.push({ id: crypto.randomUUID(), type: 'small', col, row, rotation: 0 });
+      smallLeft--;
+    } else {
+      // No more joint modules to place — still track as joint for large arm placement
+      joints.pop();
+      return false;
+    }
     return true;
   };
+
+  const totalJoints = tallCount + smallCount;
 
   // Seed in the upper portion of the grid so layout is immediately visible
   const seedCol = 3 + Math.floor(Math.random() * (COLS - 6));
   const seedRow = 1 + Math.floor(Math.random() * 2);
   if (!tryJoint(seedCol, seedRow)) tryJoint(4, 1);
 
-  for (let i = 1; i < smallCount; i++) {
-    // Candidate positions relative to existing joints:
-    //   col ± 3  → horizontal chain (fits a 2-cell HH arm between joints)
-    //   row ± 1  → vertical stack   (joints share column, each with own arms)
+  for (let i = 1; i < totalJoints; i++) {
     const candidates = shuffle(
       joints.flatMap(j => [
         { col: j.col + 3, row: j.row     },
@@ -155,7 +168,6 @@ function generateLayout(smallCount: number, largeCount: number): PlacedModule[] 
       if (tryJoint(c.col, c.row)) { placed = true; break; }
     }
     if (!placed) {
-      // Fallback: any free cell
       outer: for (let col = 0; col < COLS; col++) {
         for (let row = 0; row < ROWS; row++) {
           if (tryJoint(col, row)) { placed = true; break outer; }
@@ -309,12 +321,12 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
       const { w: mw, h: mh } = moduleSize(m);
       const worldW = mw * 2.4;
       const worldD = mh * 2.4;
-      const worldH = 2.4;
+      const worldH = m.type === 'tall' ? 3.4 : 2.4;
       const ox = m.col * 2.4;
       const oz = m.row * 2.4;
 
-      const color = m.type === 'small' ? 0x717180 : 0xf2f2f2;
-      const mat = new THREE.MeshStandardMaterial({ color, roughness: m.type === 'small' ? 0.5 : 0.15, metalness: m.type === 'small' ? 0.4 : 0.1 });
+      const color = m.type === 'small' ? 0x717180 : m.type === 'tall' ? 0xdc2626 : 0xf2f2f2;
+      const mat = new THREE.MeshStandardMaterial({ color, roughness: (m.type === 'small' || m.type === 'tall') ? 0.5 : 0.15, metalness: (m.type === 'small' || m.type === 'tall') ? 0.4 : 0.1 });
 
       // Helper: world-space Vector3 relative to module origin
       const V = (x: number, y: number, z: number) => new THREE.Vector3(ox + x, y, oz + z);
@@ -366,11 +378,11 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
 
       // Translucent glass fill panels
       const panelMat2 = new THREE.MeshStandardMaterial({
-        color: m.type === 'small' ? 0x606070 : 0xecf0f4,
-        roughness: m.type === 'small' ? 0.55 : 0.08,
+        color: m.type === 'small' ? 0x606070 : m.type === 'tall' ? 0xb91c1c : 0xecf0f4,
+        roughness: (m.type === 'small' || m.type === 'tall') ? 0.55 : 0.08,
         metalness: 0.0,
         transparent: true,
-        opacity: m.type === 'small' ? 0.80 : 0.55,
+        opacity: (m.type === 'small' || m.type === 'tall') ? 0.80 : 0.55,
         side: THREE.DoubleSide,
         depthWrite: false,
       });
@@ -391,10 +403,10 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
       addQuad(b01, b11, t11, t01);
       addQuad(b00, b01, t01, t00);
       addQuad(b10, b11, t11, t10);
-      // Ceiling panel — only for small modules (large modules have open roof)
-      if (m.type === 'small') addQuad(t00, t10, t11, t01);
+      // Ceiling panel — only for small/tall modules (large modules have open roof)
+      if (m.type === 'small' || m.type === 'tall') addQuad(t00, t10, t11, t01);
 
-      if (m.type === 'small') return;
+      if (m.type !== 'large') return;
 
       // Shed roof frame — lean-to skeleton
       // 0=eave-left  pitchInZ=false flipped=false
@@ -510,6 +522,7 @@ export default function Home() {
   const [view,    setView]    = useState<'2d' | '3d'>('2d');
   const [genSmall, setGenSmall] = useState(2);
   const [genLarge, setGenLarge] = useState(4);
+  const [genTall,  setGenTall]  = useState(0);
   const gridRef   = useRef<HTMLDivElement>(null);
   const scrollRef  = useRef<HTMLDivElement>(null);
   const needsCenterRef = useRef(false);
@@ -539,7 +552,7 @@ export default function Home() {
   const rotateModule = (id: string) => {
     setModules(prev =>
       prev.map(m => {
-        if (m.id !== id || m.type === 'small') return m;
+        if (m.id !== id || m.type === 'small' || m.type === 'tall') return m;
         const rotation = ((m.rotation + 1) % 4) as 0 | 1 | 2 | 3;
         const newSize  = rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 };
         const col      = Math.min(m.col, COLS - newSize.w);
@@ -554,9 +567,9 @@ export default function Home() {
 
   // ---- Generate layout ----
   const handleGenerate = () => {
-    if (genSmall === 0 && genLarge === 0) return;
+    if (genSmall === 0 && genLarge === 0 && genTall === 0) return;
     needsCenterRef.current = true;
-    setModules(generateLayout(genSmall, genLarge));
+    setModules(generateLayout(genSmall, genLarge, genTall));
   };
 
   // ---- Save layout ----
@@ -569,6 +582,7 @@ export default function Home() {
     if (!user) { setSaveStatus('error'); return; }
     const largeCount = modules.filter(m => m.type === 'large').length;
     const smallCount = modules.filter(m => m.type === 'small').length;
+    const tallCount  = modules.filter(m => m.type === 'tall').length;
     const area = modules.reduce((sum, m) => {
       const { w, h } = moduleSize(m);
       return sum + w * 2.4 * h * 2.4;
@@ -578,6 +592,7 @@ export default function Home() {
       layout: modules,
       large_count: largeCount,
       small_count: smallCount,
+      tall_count:  tallCount || null,
       total_area_m2: parseFloat(area.toFixed(2)),
     });
     if (error) { setSaveStatus('error'); setTimeout(() => setSaveStatus('idle'), 3000); }
@@ -620,17 +635,18 @@ export default function Home() {
       const x = (m.col - minC) * SCALE + PAD;
       const y = (m.row - minR) * SCALE + PAD;
       const isSmall = m.type === 'small';
-      const fill    = isSmall ? '#3d3d4a' : '#ffffff';
-      const stroke  = isSmall ? '#2a2a36' : '#c8ccd4';
-      const tc      = isSmall ? '#ffffff' : '#1a1a2e';
-      const tc2     = isSmall ? 'rgba(255,255,255,0.55)' : '#9098a8';
-      const label   = isSmall ? 'MALI' : 'VELIKI';
-      const size    = isSmall ? '2.4 × 2.4 m' : (w === 2 ? '4.8 × 2.4 m' : '2.4 × 4.8 m');
+      const isTall  = m.type === 'tall';
+      const fill    = isSmall ? '#3d3d4a' : isTall ? '#dc2626' : '#ffffff';
+      const stroke  = isSmall ? '#2a2a36' : isTall ? '#b91c1c' : '#c8ccd4';
+      const tc      = (isSmall || isTall) ? '#ffffff' : '#1a1a2e';
+      const tc2     = (isSmall || isTall) ? 'rgba(255,255,255,0.55)' : '#9098a8';
+      const label   = isSmall ? 'MALI' : isTall ? 'VISOKI' : 'VELIKI';
+      const size    = isSmall ? '2.4 × 2.4 m' : isTall ? '2.4 × 2.4 m (3.4m)' : (w === 2 ? '4.8 × 2.4 m' : '2.4 × 4.8 m');
       const numX    = x + w * SCALE - 10;
       const numY    = y + 14;
       const cx      = x + w * SCALE / 2;
       const cy      = y + h * SCALE / 2;
-      const shadow  = isSmall ? '' : `<rect x="${x+4}" y="${y+4}" width="${w*SCALE-8}" height="${h*SCALE-8}" rx="7" fill="#e4e7ec" opacity="0.6"/>`;
+      const shadow  = (isSmall || isTall) ? '' : `<rect x="${x+4}" y="${y+4}" width="${w*SCALE-8}" height="${h*SCALE-8}" rx="7" fill="#e4e7ec" opacity="0.6"/>`;
       return [
         shadow,
         `<rect x="${x+2}" y="${y+2}" width="${w*SCALE-4}" height="${h*SCALE-4}" rx="8" fill="${fill}" stroke="${stroke}" stroke-width="1"/>`,
@@ -643,8 +659,10 @@ export default function Home() {
     const legend = `<g transform="translate(${PAD},${svgH - 18})">
       <rect x="0" y="-7" width="10" height="10" rx="2" fill="#3d3d4a"/>
       <text x="14" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Mali (2.4 × 2.4 m)</text>
-      <rect x="130" y="-7" width="10" height="10" rx="2" fill="#ffffff" stroke="#c8ccd4" stroke-width="1"/>
-      <text x="144" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Veliki (4.8 × 2.4 m / 2.4 × 4.8 m)</text>
+      <rect x="130" y="-7" width="10" height="10" rx="2" fill="#dc2626"/>
+      <text x="144" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Visoki (2.4 × 2.4 m, 3.4m)</text>
+      <rect x="300" y="-7" width="10" height="10" rx="2" fill="#ffffff" stroke="#c8ccd4" stroke-width="1"/>
+      <text x="314" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Veliki (4.8 × 2.4 m / 2.4 × 4.8 m)</text>
     </g>`;
     const bboxW = bbox ? bbox.w.toFixed(1) : '—';
     const bboxH = bbox ? bbox.h.toFixed(1) : '—';
@@ -708,9 +726,9 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
     <div class="badge">NACRT / DRAFT</div>
   </div>
   <div class="stats">
-    <div class="stat"><div class="stat-label">Ukupno modula</div><div class="stat-value">${modules.length}<span class="stat-unit">kom</span></div></div>
     <div class="stat"><div class="stat-label">Mali moduli</div><div class="stat-value">${smallCount}<span class="stat-unit">mod.</span></div></div>
     <div class="stat"><div class="stat-label">Veliki moduli</div><div class="stat-value">${largeCount}<span class="stat-unit">mod.</span></div></div>
+    <div class="stat"><div class="stat-label">Visoki moduli</div><div class="stat-value">${tallCount}<span class="stat-unit">mod.</span></div></div>
     <div class="stat"><div class="stat-label">Gabarit</div><div class="stat-value" style="font-size:14px">${bboxW}<span class="stat-unit">×</span>${bboxH}<span class="stat-unit">m</span></div></div>
     <div class="stat"><div class="stat-label">Ukupna površina</div><div class="stat-value" style="font-size:16px">${totalAreaVal}<span class="stat-unit">m²</span></div></div>
   </div>
@@ -818,6 +836,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
 
   const smallCount = modules.filter(m => m.type === 'small').length;
   const largeCount = modules.filter(m => m.type === 'large').length;
+  const tallCount  = modules.filter(m => m.type === 'tall').length;
 
   // ---- Bounding box + area ----
   const bbox = modules.length === 0 ? null : (() => {
@@ -954,6 +973,31 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
             <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.22)', fontWeight: 400 }}>2.4m</span>
           </button>
 
+          {/* Add tall */}
+          <button
+            onClick={() => addModule('tall')}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)',
+              borderRadius: 8, padding: '6px 13px',
+              color: 'rgba(255,255,255,0.65)', cursor: 'pointer',
+              fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+              transition: 'all 0.12s',
+            }}
+            onMouseEnter={e => {
+              (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.1)';
+              (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+            }}
+            onMouseLeave={e => {
+              (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.05)';
+              (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.65)';
+            }}
+          >
+            <span style={{ fontSize: 18, lineHeight: 1, fontWeight: 200, color: 'rgba(255,255,255,0.4)', marginBottom: 1 }}>+</span>
+            <span>Visoki</span>
+            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.22)', fontWeight: 400 }}>3.4m</span>
+          </button>
+
           {/* Add large */}
           <button
             onClick={() => addModule('large')}
@@ -1008,6 +1052,28 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
 
           <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
 
+          {/* Visoki stepper */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <span style={{ fontSize: 13, fontWeight: 500, color: '#dc2626', whiteSpace: 'nowrap' }}>Visoki</span>
+            <div style={{ display: 'flex', alignItems: 'center', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, overflow: 'hidden' }}>
+              <button
+                onClick={() => setGenTall(s => Math.max(0, s - 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >−</button>
+              <span style={{ width: 36, textAlign: 'center', fontSize: 15, fontWeight: 700, color: 'rgba(255,255,255,0.9)', fontVariantNumeric: 'tabular-nums', userSelect: 'none' }}>{genTall}</span>
+              <button
+                onClick={() => setGenTall(s => Math.min(20, s + 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >+</button>
+            </div>
+          </div>
+
+          <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
+
           {/* Veliki stepper */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
             <span style={{ fontSize: 13, fontWeight: 500, color: 'rgba(255,255,255,0.6)', whiteSpace: 'nowrap' }}>Veliki</span>
@@ -1031,25 +1097,25 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
           {/* Generiši button */}
           <button
             onClick={handleGenerate}
-            disabled={genSmall === 0 && genLarge === 0}
+            disabled={genSmall === 0 && genLarge === 0 && genTall === 0}
             style={{
-              background: genSmall === 0 && genLarge === 0 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.1)',
+              background: genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.1)',
               border: '1px solid rgba(255,255,255,0.13)',
               borderRadius: 8, padding: '0 16px', height: 32,
-              color: genSmall === 0 && genLarge === 0 ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.82)',
-              cursor: genSmall === 0 && genLarge === 0 ? 'not-allowed' : 'pointer',
+              color: genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.82)',
+              cursor: genSmall === 0 && genLarge === 0 && genTall === 0 ? 'not-allowed' : 'pointer',
               fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap',
               transition: 'all 0.12s',
             }}
             onMouseEnter={e => {
-              if (genSmall > 0 || genLarge > 0) {
+              if (genSmall > 0 || genLarge > 0 || genTall > 0) {
                 (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.18)';
                 (e.currentTarget as HTMLButtonElement).style.color = '#fff';
               }
             }}
             onMouseLeave={e => {
-              (e.currentTarget as HTMLButtonElement).style.background = genSmall === 0 && genLarge === 0 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.1)';
-              (e.currentTarget as HTMLButtonElement).style.color = genSmall === 0 && genLarge === 0 ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.82)';
+              (e.currentTarget as HTMLButtonElement).style.background = genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.1)';
+              (e.currentTarget as HTMLButtonElement).style.color = genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.82)';
             }}
           >
             Generiši
@@ -1254,6 +1320,12 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         </div>
         <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 14px' }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#dc2626', flexShrink: 0, display: 'block' }} />
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Visoki</span>
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{tallCount}</span>
+        </div>
+        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 14px' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#c8c8c8', flexShrink: 0, display: 'block' }} />
           <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Veliki</span>
           <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{largeCount}</span>
@@ -1324,7 +1396,8 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
           {/* ── Placed modules ── */}
           {modules.map(m => {
             const { w, h } = moduleSize(m);
-            const isSmall       = m.type === 'small';
+            const isSmall        = m.type === 'small';
+            const isTall         = m.type === 'tall';
             const isBeingDragged = drag?.id === m.id;
 
             return (
@@ -1349,15 +1422,15 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                     width:         '100%',
                     height:        '100%',
                     borderRadius:  14,
-                    background:    isSmall ? '#71717a' : '#ffffff',
+                    background:    isSmall ? '#71717a' : isTall ? '#dc2626' : '#ffffff',
                     position:      'relative',
                     overflow:      'hidden',
-                    boxShadow:     isSmall ? '0 4px 20px rgba(0,0,0,0.45)' : '0 4px 24px rgba(0,0,0,0.3)',
+                    boxShadow:     (isSmall || isTall) ? '0 4px 20px rgba(0,0,0,0.45)' : '0 4px 24px rgba(0,0,0,0.3)',
                   }}
                 >
                   {/* Roof eave indicator — 4 orientations
                       0=LEFT(▶)  1=TOP(▼)  2=RIGHT(◀)  3=BOTTOM(▲) */}
-                  {!isSmall && (() => {
+                  {!isSmall && !isTall && (() => {
                     const r = m.rotation;
                     const grad = [
                       'linear-gradient(to right,  rgba(0,0,0,0.06) 0%, transparent 60%)',
@@ -1385,7 +1458,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                     position: 'absolute', top: 14, right: 14,
                     display: 'flex', gap: 4, zIndex: 1,
                   }}>
-                    {!isSmall && (
+                    {!isSmall && !isTall && (
                       <button
                         onMouseDown={e => e.stopPropagation()}
                         onClick={e => { e.stopPropagation(); rotateModule(m.id); }}
@@ -1407,24 +1480,24 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                       title="Ukloni"
                       style={{
                         width: 22, height: 22, borderRadius: '50%',
-                        background: isSmall ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)',
-                        border: 'none', cursor: 'pointer', color: isSmall ? '#fff' : '#333',
+                        background: (isSmall || isTall) ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)',
+                        border: 'none', cursor: 'pointer', color: (isSmall || isTall) ? '#fff' : '#333',
                         fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center',
                         transition: 'background 0.15s', flexShrink: 0,
                       }}
                       onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(239,68,68,0.5)')}
-                      onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = isSmall ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)')}
+                      onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = (isSmall || isTall) ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)')}
                     >✕</button>
                   </div>
 
                   {/* Label — bottom-left, always shown at CELL=120 */}
                   {(w * CELL > 40 && h * CELL > 40) && (
                     <div style={{ position: 'absolute', bottom: 14, left: 14 }}>
-                      <p style={{ fontSize: Math.min(18, w * CELL * 0.11), fontWeight: 800, lineHeight: 1, margin: 0, color: isSmall ? '#fff' : '#1a1a2e' }}>
-                        {isSmall ? 'MALI' : 'VELIKI'}
+                      <p style={{ fontSize: Math.min(18, w * CELL * 0.11), fontWeight: 800, lineHeight: 1, margin: 0, color: (isSmall || isTall) ? '#fff' : '#1a1a2e' }}>
+                        {isSmall ? 'MALI' : isTall ? 'VISOKI' : 'VELIKI'}
                       </p>
-                      <p style={{ fontSize: 10, opacity: 0.45, margin: '3px 0 0', whiteSpace: 'nowrap', color: isSmall ? '#fff' : '#1a1a2e' }}>
-                        {isSmall ? '2.4 × 2.4 m' : m.rotation % 2 !== 0 ? '2.4 × 4.8 m' : '4.8 × 2.4 m'}
+                      <p style={{ fontSize: 10, opacity: 0.45, margin: '3px 0 0', whiteSpace: 'nowrap', color: (isSmall || isTall) ? '#fff' : '#1a1a2e' }}>
+                        {isSmall ? '2.4 × 2.4 m' : isTall ? '2.4 × 2.4 m (3.4m)' : m.rotation % 2 !== 0 ? '2.4 × 4.8 m' : '4.8 × 2.4 m'}
                       </p>
                     </div>
                   )}
