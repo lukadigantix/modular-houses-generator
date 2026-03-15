@@ -8,9 +8,11 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 // ---------------------------------------------------------------------------
 // Constants — 1 cell = 2.4 m in real life
 // ---------------------------------------------------------------------------
-const CELL     = 120;  // px (logical, before zoom)
-const COLS     = 16;
-const ROWS     = 10;
+const CELL         = 120;  // px (logical, before zoom)
+const DEFAULT_COLS = 20;
+const DEFAULT_ROWS = 14;
+const GRID_MARGIN  = 3;   // cells of buffer before auto-expand triggers
+const GRID_EXPAND  = 4;   // cells added per expansion
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 2.5;
 const ZOOM_STEP = 0.15;
@@ -58,22 +60,24 @@ function overlaps(a: PlacedModule, b: PlacedModule): boolean {
   );
 }
 
-function inBounds(m: PlacedModule): boolean {
+function inBounds(m: PlacedModule, cols: number, rows: number): boolean {
   const { w, h } = moduleSize(m);
-  return m.col >= 0 && m.row >= 0 && m.col + w <= COLS && m.row + h <= ROWS;
+  return m.col >= 0 && m.row >= 0 && m.col + w <= cols && m.row + h <= rows;
 }
 
 function firstFreePosition(
   type:     ModuleType,
   rotation: 0 | 1 | 2 | 3,
   placed:   PlacedModule[],
+  cols:     number,
+  rows:     number,
 ): { col: number; row: number } | null {
   const dummy = { id: '__test__', type, col: 0, row: 0, rotation } as PlacedModule;
   // Step by 0.5 so auto-placement also respects the half-cell grid
-  for (let row = 0; row < ROWS; row += 0.5) {
-    for (let col = 0; col < COLS; col += 0.5) {
+  for (let row = 0; row < rows; row += 0.5) {
+    for (let col = 0; col < cols; col += 0.5) {
       const candidate = { ...dummy, col, row };
-      if (inBounds(candidate) && !placed.some(m => overlaps(candidate, m))) {
+      if (inBounds(candidate, cols, rows) && !placed.some(m => overlaps(candidate, m))) {
         return { col, row };
       }
     }
@@ -97,7 +101,7 @@ function firstFreePosition(
 //     Horizontal chain :  next joint at col ± 3  (leaves 2 cells for HH arm)
 //     Vertical stack   :  next joint at row ± 1  (joints share the same column)
 // ---------------------------------------------------------------------------
-function generateLayout(smallCount: number, largeCount: number, tallCount: number): PlacedModule[] {
+function generateLayout(smallCount: number, largeCount: number, tallCount: number, cols = DEFAULT_COLS, rows = DEFAULT_ROWS): PlacedModule[] {
   const result: PlacedModule[] = [];
 
   const shuffle = <T,>(arr: T[]): T[] => {
@@ -111,7 +115,7 @@ function generateLayout(smallCount: number, largeCount: number, tallCount: numbe
 
   // Check whether a rectangle (col, row, w, h) is on the grid and overlaps nothing in result
   const free = (col: number, row: number, w: number, h: number): boolean => {
-    if (col < 0 || row < 0 || col + w > COLS || row + h > ROWS) return false;
+    if (col < 0 || row < 0 || col + w > cols || row + h > rows) return false;
     return !result.some(m => {
       const { w: mw, h: mh } = moduleSize(m);
       return col < m.col + mw && col + w > m.col && row < m.row + mh && row + h > m.row;
@@ -145,7 +149,7 @@ function generateLayout(smallCount: number, largeCount: number, tallCount: numbe
   const totalJoints = tallCount + smallCount;
 
   // Seed in the upper portion of the grid so layout is immediately visible
-  const seedCol = 3 + Math.floor(Math.random() * (COLS - 6));
+  const seedCol = 3 + Math.floor(Math.random() * (cols - 6));
   const seedRow = 1 + Math.floor(Math.random() * 2);
   if (!tryJoint(seedCol, seedRow)) tryJoint(4, 1);
 
@@ -168,8 +172,8 @@ function generateLayout(smallCount: number, largeCount: number, tallCount: numbe
       if (tryJoint(c.col, c.row)) { placed = true; break; }
     }
     if (!placed) {
-      outer: for (let col = 0; col < COLS; col++) {
-        for (let row = 0; row < ROWS; row++) {
+      outer: for (let col = 0; col < cols; col++) {
+        for (let row = 0; row < rows; row++) {
           if (tryJoint(col, row)) { placed = true; break outer; }
         }
       }
@@ -223,8 +227,20 @@ const ROOF_RISE = 1.0; // lean-to roof rise in meters
 // ---------------------------------------------------------------------------
 // Scene3D — Three.js 3D preview
 // ---------------------------------------------------------------------------
-function Scene3D({ modules }: { modules: PlacedModule[] }) {
+function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: number; rows: number }) {
   const mountRef = useRef<HTMLDivElement>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+
+  const takeScreenshot = useCallback(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    // Render one extra frame so preserveDrawingBuffer isn't needed
+    const url = renderer.domElement.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `modular-${Date.now()}.png`;
+    a.click();
+  }, []);
 
   useEffect(() => {
     const mount = mountRef.current!;
@@ -234,7 +250,8 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
     const h = mount.clientHeight || (window.innerHeight - 56);
 
     // Renderer
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    rendererRef.current = renderer;
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(w, h);
     renderer.shadowMap.enabled = true;
@@ -253,8 +270,8 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
     // Compute center from placed modules (or fall back to grid centre)
     let centerX: number, centerZ: number;
     if (modules.length === 0) {
-      centerX = (COLS / 2) * 2.4;
-      centerZ = (ROWS / 2) * 2.4;
+      centerX = (cols / 2) * 2.4;
+      centerZ = (rows / 2) * 2.4;
     } else {
       let minC = Infinity, minR = Infinity, maxC = -Infinity, maxR = -Infinity;
       for (const m of modules) {
@@ -295,7 +312,7 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
     scene.add(fillLight);
 
     // Floor
-    const floorGeo = new THREE.PlaneGeometry(COLS * 2.4 + 60, ROWS * 2.4 + 60);
+    const floorGeo = new THREE.PlaneGeometry(cols * 2.4 + 60, rows * 2.4 + 60);
     const floorMat = new THREE.MeshStandardMaterial({ color: 0x232330, roughness: 0.88, metalness: 0.05 });
     const floor = new THREE.Mesh(floorGeo, floorMat);
     floor.rotation.x = -Math.PI / 2;
@@ -305,8 +322,8 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
 
     // Grid lines
     const gridHelper = new THREE.GridHelper(
-      Math.max(COLS, ROWS) * 2.4 + 10,
-      Math.max(COLS, ROWS) + 4,
+      Math.max(cols, rows) * 2.4 + 10,
+      Math.max(cols, rows) + 4,
       0x2d2d3c,
       0x272732,
     );
@@ -353,10 +370,27 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
       const b10 = V(x1, 0,      z0);  // floor front-right
       const b01 = V(x0, 0,      z1);  // floor back-left
       const b11 = V(x1, 0,      z1);  // floor back-right
-      const t00 = V(x0, worldH, z0);  // top front-left
-      const t10 = V(x1, worldH, z0);  // top front-right
-      const t01 = V(x0, worldH, z1);  // top back-left
-      const t11 = V(x1, worldH, z1);  // top back-right
+
+      // For large modules: sloped top — the module itself IS the trapezoid (no separate roof)
+      let h00 = worldH, h10 = worldH, h01 = worldH, h11 = worldH;
+      if (m.type === 'large') {
+        const pitchInZ = m.rotation === 1 || m.rotation === 3;
+        const flipped  = m.rotation === 2 || m.rotation === 3;
+        if (!pitchInZ) {
+          // slope along X: x0=low side, x1=high side (or flipped)
+          h00 = h01 = flipped ? worldH + ROOF_RISE : worldH;
+          h10 = h11 = flipped ? worldH : worldH + ROOF_RISE;
+        } else {
+          // slope along Z: z0=low side, z1=high side (or flipped)
+          h00 = h10 = flipped ? worldH + ROOF_RISE : worldH;
+          h01 = h11 = flipped ? worldH : worldH + ROOF_RISE;
+        }
+      }
+
+      const t00 = V(x0, h00, z0);  // top front-left
+      const t10 = V(x1, h10, z0);  // top front-right
+      const t01 = V(x0, h01, z1);  // top back-left
+      const t11 = V(x1, h11, z1);  // top back-right
 
       // 4 vertical corner posts
       addMember(b00, t00);
@@ -364,7 +398,7 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
       addMember(b01, t01);
       addMember(b11, t11);
 
-      // Top perimeter beams
+      // Top perimeter beams — all 4 edges (form sloped frame for large, flat for others)
       addMember(t00, t10);
       addMember(t01, t11);
       addMember(t00, t01);
@@ -398,76 +432,23 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
         qmesh.receiveShadow = true;
         scene.add(qmesh);
       };
-      // 4 walls
+
+      // 4 walls (trapezoidal for large on sloped sides, rectangular for small/tall)
       addQuad(b00, b10, t10, t00);
       addQuad(b01, b11, t11, t01);
       addQuad(b00, b01, t01, t00);
       addQuad(b10, b11, t11, t10);
-      // Ceiling panel — only for small/tall modules (large modules have open roof)
-      if (m.type === 'small' || m.type === 'tall') addQuad(t00, t10, t11, t01);
 
-      if (m.type !== 'large') return;
-
-      // Shed roof frame — lean-to skeleton
-      // 0=eave-left  pitchInZ=false flipped=false
-      // 1=eave-top   pitchInZ=true  flipped=false
-      // 2=eave-right pitchInZ=false flipped=true
-      // 3=eave-bot   pitchInZ=true  flipped=true
-      const pitchInZ = m.rotation === 1 || m.rotation === 3;
-      const flipped  = m.rotation === 2 || m.rotation === 3;
-      const roofMat  = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.2, metalness: 0.15 });
-
-      let eave0: THREE.Vector3, eave1: THREE.Vector3;
-      let ridge0: THREE.Vector3, ridge1: THREE.Vector3;
-
-      if (!pitchInZ) {
-        // Slope runs along X; eave and ridge are parallel to Z
-        const eX = flipped ? x1 : x0;
-        const rX = flipped ? x0 : x1;
-        eave0  = V(eX, worldH,             z0);
-        eave1  = V(eX, worldH,             z1);
-        ridge0 = V(rX, worldH + ROOF_RISE, z0);
-        ridge1 = V(rX, worldH + ROOF_RISE, z1);
+      // Top panel — sloped for large, flat ceiling for small/tall
+      if (m.type === 'large') {
+        const roofPanelMat = new THREE.MeshStandardMaterial({
+          color: 0xd0d8e0, roughness: 0.12, metalness: 0.2,
+          transparent: true, opacity: 0.70, side: THREE.DoubleSide, depthWrite: false,
+        });
+        addQuad(t00, t10, t11, t01, roofPanelMat);
       } else {
-        // Slope runs along Z; eave and ridge are parallel to X
-        const eZ = flipped ? z1 : z0;
-        const rZ = flipped ? z0 : z1;
-        eave0  = V(x0, worldH,             eZ);
-        eave1  = V(x1, worldH,             eZ);
-        ridge0 = V(x0, worldH + ROOF_RISE, rZ);
-        ridge1 = V(x1, worldH + ROOF_RISE, rZ);
+        addQuad(t00, t10, t11, t01);
       }
-
-      // Eave beam & ridge beam
-      addMember(eave0,  eave1,  roofMat);
-      addMember(ridge0, ridge1, roofMat);
-
-      // Gable edge rafters (sloped edges of the roof)
-      addMember(eave0, ridge0, roofMat);
-      addMember(eave1, ridge1, roofMat);
-
-      // Ridge-side wall closure — vertical posts + panel bridging wall-top to ridge beam
-      const rBase0 = ridge0.clone().setY(worldH);
-      const rBase1 = ridge1.clone().setY(worldH);
-      addMember(rBase0, ridge0, roofMat);
-      addMember(rBase1, ridge1, roofMat);
-      addQuad(rBase0, rBase1, ridge1, ridge0, panelMat2);
-
-      // Gable fill — triangular areas on end-walls above worldH, under the sloped roof
-      addQuad(eave0, rBase0, ridge0, eave0, panelMat2);
-      addQuad(eave1, rBase1, ridge1, eave1, panelMat2);
-
-      // Roof fill panel
-      const roofPanelMat = new THREE.MeshStandardMaterial({
-        color: 0xd0d8e0,
-        roughness: 0.12,
-        metalness: 0.2,
-        transparent: true,
-        opacity: 0.70,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      });
-      addQuad(eave0, eave1, ridge1, ridge0, roofPanelMat);
     });
 
     // OrbitControls — target the layout centre
@@ -509,7 +490,11 @@ function Scene3D({ modules }: { modules: PlacedModule[] }) {
   // Only re-init when the placed modules change
   }, [modules]);
 
-  return <div ref={mountRef} style={{ position: 'absolute', inset: 0 }} />;
+  return (
+    <div style={{ position: 'absolute', inset: 0 }}>
+      <div ref={mountRef} style={{ position: 'absolute', inset: 0 }} />
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +505,18 @@ export default function Home() {
   const [drag,    setDrag]    = useState<DragState | null>(null);
   const [zoom,    setZoom]    = useState(1);
   const [view,    setView]    = useState<'2d' | '3d'>('2d');
+  const [cols,    setCols]    = useState(DEFAULT_COLS);
+  const [rows,    setRows]    = useState(DEFAULT_ROWS);
   const [genSmall, setGenSmall] = useState(2);
+
+  // AI image generation state
+  const [aiModalOpen,     setAiModalOpen]     = useState(false);
+  const [aiPrompt,        setAiPrompt]        = useState('');
+  const [aiLoading,       setAiLoading]       = useState(false);
+  const [aiImageUrl,      setAiImageUrl]      = useState<string | null>(null);
+  const [aiError,         setAiError]         = useState<string | null>(null);
+  const [aiHistory,       setAiHistory]       = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [aiScreenshot,    setAiScreenshot]    = useState<string | null>(null);
   const [genLarge, setGenLarge] = useState(4);
   const [genTall,  setGenTall]  = useState(0);
   const gridRef   = useRef<HTMLDivElement>(null);
@@ -530,12 +526,26 @@ export default function Home() {
   const zoomRef   = useRef(zoom);
   useEffect(() => { zoomRef.current = zoom; }, [zoom]);
 
+  // Auto-expand grid when a module gets within GRID_MARGIN cells of an edge
+  useEffect(() => {
+    if (modules.length === 0) return;
+    let newCols = cols;
+    let newRows = rows;
+    for (const m of modules) {
+      const { w, h } = moduleSize(m);
+      if (m.col + w >= cols - GRID_MARGIN) newCols = Math.max(newCols, m.col + w + GRID_MARGIN + GRID_EXPAND);
+      if (m.row + h >= rows - GRID_MARGIN) newRows = Math.max(newRows, m.row + h + GRID_MARGIN + GRID_EXPAND);
+    }
+    if (newCols !== cols) setCols(newCols);
+    if (newRows !== rows) setRows(newRows);
+  }, [modules, cols, rows]);
+
   const changeZoom = (delta: number) =>
     setZoom(prev => parseFloat(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev + delta)).toFixed(2)));
 
   // ---- Add module ----
   const addModule = (type: ModuleType) => {
-    const pos = firstFreePosition(type, 0, modules);
+    const pos = firstFreePosition(type, 0, modules, cols, rows);
     if (!pos) return; // grid full
     setModules(prev => [
       ...prev,
@@ -555,8 +565,8 @@ export default function Home() {
         if (m.id !== id || m.type === 'small' || m.type === 'tall') return m;
         const rotation = ((m.rotation + 1) % 4) as 0 | 1 | 2 | 3;
         const newSize  = rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 };
-        const col      = Math.min(m.col, COLS - newSize.w);
-        const row      = Math.min(m.row, ROWS - newSize.h);
+        const col      = Math.min(m.col, cols - newSize.w);
+        const row      = Math.min(m.row, rows - newSize.h);
         const updated  = { ...m, rotation, col, row };
         const others   = prev.filter(o => o.id !== id);
         if (others.some(o => overlaps(updated, o))) return m;
@@ -569,7 +579,7 @@ export default function Home() {
   const handleGenerate = () => {
     if (genSmall === 0 && genLarge === 0 && genTall === 0) return;
     needsCenterRef.current = true;
-    setModules(generateLayout(genSmall, genLarge, genTall));
+    setModules(generateLayout(genSmall, genLarge, genTall, cols, rows));
   };
 
   // ---- Save layout ----
@@ -597,6 +607,43 @@ export default function Home() {
     });
     if (error) { setSaveStatus('error'); setTimeout(() => setSaveStatus('idle'), 3000); }
     else { setSaveStatus('saved'); setTimeout(() => setSaveStatus('idle'), 2500); }
+  };
+
+  // ---- AI Image generation ----
+  const handleAiGenerate = async () => {
+    if (!aiPrompt.trim() || aiLoading) return;
+    setAiLoading(true);
+    setAiError(null);
+    setAiImageUrl(null);
+
+    try {
+      const canvas = document.querySelector('canvas') as HTMLCanvasElement | null;
+      const screenshotBase64 = aiScreenshot ?? (canvas ? canvas.toDataURL('image/png') : '');
+
+      const res = await fetch('/api/generate-ai-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          screenshotBase64,
+          userPrompt: aiPrompt.trim(),
+          conversationHistory: aiHistory,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Greška pri generisanju');
+
+      setAiImageUrl(data.imageUrl);
+      setAiHistory(prev => [
+        ...prev,
+        { role: 'user', content: aiPrompt.trim() },
+        { role: 'assistant', content: data.imageUrl },
+      ]);
+    } catch (err) {
+      setAiError(err instanceof Error ? err.message : 'Nepoznata greška');
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   // ---- Logout ----
@@ -806,7 +853,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       if (m) {
         const candidate = { ...m, col: drag.ghostCol, row: drag.ghostRow };
         const others    = modules.filter(o => o.id !== drag.id);
-        const valid     = inBounds(candidate) && !others.some(o => overlaps(candidate, o));
+        const valid     = inBounds(candidate, cols, rows) && !others.some(o => overlaps(candidate, o));
         if (valid) {
           setModules(prev =>
             prev.map(mod => (mod.id === drag.id ? { ...mod, col: drag.ghostCol, row: drag.ghostRow } : mod)),
@@ -830,7 +877,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
     ? (() => {
         const candidate = { ...draggingModule, col: drag!.ghostCol, row: drag!.ghostRow };
         const others    = modules.filter(o => o.id !== drag!.id);
-        return inBounds(candidate) && !others.some(o => overlaps(candidate, o));
+        return inBounds(candidate, cols, rows) && !others.some(o => overlaps(candidate, o));
       })()
     : false;
 
@@ -1352,6 +1399,51 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
             {totalArea > 0 ? `${totalArea.toFixed(2)} m²` : '—'}
           </span>
         </div>
+        {/* Screenshot dugme — vidljivo samo u 3D */}
+        {view === '3d' && (
+          <>
+            <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 22px' }} />
+            <button
+              onClick={() => { const r = (document.querySelector('canvas') as HTMLCanvasElement); if (!r) return; const a = document.createElement('a'); a.href = r.toDataURL('image/png'); a.download = `modular-${Date.now()}.png`; a.click(); }}
+              title="Snimi sliku"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 7, padding: '0 10px', height: 26, cursor: 'pointer',
+                color: 'rgba(255,255,255,0.7)', fontSize: 12, fontWeight: 600,
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+              Snimi
+            </button>
+            <button
+              onClick={() => {
+                const canvas = document.querySelector('canvas') as HTMLCanvasElement | null;
+                const shot = canvas ? canvas.toDataURL('image/png') : null;
+                setAiScreenshot(shot);
+                setAiModalOpen(true);
+                setAiImageUrl(null);
+                setAiError(null);
+              }}
+              title="Generiši AI vizualizaciju"
+              style={{
+                marginLeft: 8,
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: 'rgba(99,102,241,0.18)', border: '1px solid rgba(99,102,241,0.45)',
+                borderRadius: 7, padding: '0 10px', height: 26, cursor: 'pointer',
+                color: 'rgba(180,180,255,0.95)', fontSize: 12, fontWeight: 600,
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>
+              </svg>
+              AI vizualizacija
+            </button>
+          </>
+        )}
       </div>
 
       {/* ── Grid area ─────────────────────────────────────────────── */}
@@ -1363,7 +1455,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         style={{ cursor: drag ? 'grabbing' : 'default' }}
       >
         {/* Spacer so scrollbar tracks the zoomed size */}
-        <div style={{ width: COLS * CELL * zoom, height: ROWS * CELL * zoom, position: 'relative', flexShrink: 0 }}>
+        <div style={{ width: cols * CELL * zoom, height: rows * CELL * zoom, position: 'relative', flexShrink: 0 }}>
           {/* Actual grid — scaled from top-left */}
           <div
             ref={gridRef}
@@ -1373,8 +1465,8 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               left:            0,
               transformOrigin: 'top left',
               transform:       `scale(${zoom})`,
-              width:           COLS * CELL,
-              height:          ROWS * CELL,
+              width:           cols * CELL,
+              height:          rows * CELL,
               backgroundColor: '#0f0f12',
               // Two dot layers: full-cell (bright) + half-cell (dim)
               backgroundImage: [
@@ -1542,7 +1634,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       </div>
       ) : (
       <div style={{ position: 'relative', height: 'calc(100vh - 56px)' }}>
-        <Scene3D modules={modules} />
+        <Scene3D modules={modules} cols={cols} rows={rows} />
         {modules.length === 0 && (
           <div style={{
             position: 'absolute', inset: 0,
@@ -1556,6 +1648,140 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         )}
       </div>
       )}
+
+      {/* ── AI Vizualizacija Modal ─────────────────────────────────── */}
+      {aiModalOpen && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1000,
+            background: 'rgba(0,0,0,0.75)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            backdropFilter: 'blur(4px)',
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setAiModalOpen(false); }}
+        >
+          <div style={{
+            background: '#111118', border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: 16, padding: 28, width: '90vw', maxWidth: 760,
+            display: 'flex', flexDirection: 'column', gap: 20,
+            fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif',
+          }}>
+            {/* Header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: 'rgba(255,255,255,0.92)' }}>AI Vizualizacija</h2>
+                <p style={{ margin: '4px 0 0', fontSize: 12, color: 'rgba(255,255,255,0.38)' }}>
+                  Opiši ambijent — raspored modula ostaje nepromenjen
+                </p>
+              </div>
+              <button
+                onClick={() => setAiModalOpen(false)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.4)', fontSize: 20, lineHeight: 1, padding: 4 }}
+              >×</button>
+            </div>
+
+            {/* Screenshot preview */}
+            {aiScreenshot && (
+              <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)', position: 'relative' }}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={aiScreenshot} alt="3D snapshot" style={{ width: '100%', display: 'block', maxHeight: 240, objectFit: 'cover' }} />
+                <div style={{
+                  position: 'absolute', bottom: 8, left: 8,
+                  background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
+                  borderRadius: 6, padding: '3px 8px',
+                  fontSize: 11, color: 'rgba(255,255,255,0.7)', fontWeight: 500,
+                }}>Snimljeni 3D model — šalje se AI-u</div>
+              </div>
+            )}
+
+            {/* Prompt history */}
+            {aiHistory.filter(m => m.role === 'user').length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap' as const, gap: 6 }}>
+                <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.28)', alignSelf: 'center' }}>Prethodni:</span>
+                {aiHistory.filter(m => m.role === 'user').slice(-4).map((m, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setAiPrompt(m.content)}
+                    style={{
+                      fontSize: 11, padding: '3px 9px', borderRadius: 20,
+                      background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.3)',
+                      color: 'rgba(180,180,255,0.8)', cursor: 'pointer',
+                    }}
+                  >{m.content.length > 40 ? m.content.slice(0, 40) + '…' : m.content}</button>
+                ))}
+              </div>
+            )}
+
+            {/* Prompt input */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <textarea
+                value={aiPrompt}
+                onChange={e => setAiPrompt(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !aiLoading && aiPrompt.trim()) { e.preventDefault(); handleAiGenerate(); } }}
+                placeholder='npr. "okružen borovom šumom, jutro, magla" ili "urbano okruženje, noć, neonska svetla"'
+                rows={3}
+                style={{
+                  width: '100%', boxSizing: 'border-box',
+                  background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 9, padding: '10px 14px', color: 'rgba(255,255,255,0.9)',
+                  fontSize: 13, outline: 'none', resize: 'vertical', lineHeight: 1.5,
+                }}
+              />
+              <button
+                onClick={handleAiGenerate}
+                disabled={aiLoading || !aiPrompt.trim()}
+                style={{
+                  width: '100%', height: 42, borderRadius: 9, border: 'none',
+                  cursor: aiLoading || !aiPrompt.trim() ? 'not-allowed' : 'pointer',
+                  background: aiLoading || !aiPrompt.trim() ? 'rgba(99,102,241,0.25)' : 'rgba(99,102,241,0.85)',
+                  color: 'white', fontSize: 13, fontWeight: 600,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7,
+                }}
+              >
+                {aiLoading ? (
+                  <>
+                    <svg style={{ animation: 'spin 1s linear infinite' }} width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+                    Generiše...
+                  </>
+                ) : 'Generiši'}
+              </button>
+            </div>
+
+            {/* Error */}
+            {aiError && (
+              <p style={{ margin: 0, fontSize: 13, color: '#f87171', background: 'rgba(248,113,113,0.1)', padding: '10px 14px', borderRadius: 8 }}>
+                {aiError}
+              </p>
+            )}
+
+            {/* Result image */}
+            {aiImageUrl && (
+              <div style={{ position: 'relative', borderRadius: 10, overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)' }}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={aiImageUrl} alt="AI vizualizacija" style={{ width: '100%', display: 'block' }} />
+                <a
+                  href={aiImageUrl}
+                  download={`ai-vizualizacija-${Date.now()}.png`}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    position: 'absolute', bottom: 12, right: 12,
+                    background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)',
+                    border: '1px solid rgba(255,255,255,0.2)', borderRadius: 8,
+                    padding: '6px 12px', color: 'white', fontSize: 12, fontWeight: 600,
+                    textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 5,
+                  }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  Preuzmi
+                </a>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <style>{`@keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }`}</style>
     </div>
   );
 }
