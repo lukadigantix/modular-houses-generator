@@ -21,13 +21,25 @@ const ZOOM_STEP = 0.15;
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-type ModuleType = 'large' | 'small' | 'medium';
+type ModuleType = 'large' | 'small' | 'medium' | 'deck' | 'smalldeck';
+
+interface LightSettings {
+  isDay:        boolean;
+  sunAngle:     number; // 0-359°, 0=Sever, 90=Istok, 180=Jug, 270=Zapad
+  sunElevation: number; // 5-85°
+}
+
+type GrassType = 'trava' | 'suva' | 'zemlja' | 'pesak' | 'beton';
+interface SceneSettings {
+  grass:      GrassType;
+  fogEnabled: boolean;
+}
 
 interface PlacedModule {
   id:      string;
   type:    ModuleType;
-  glbFile: string; // 'large_full_final.glb' or 'small_full.glb'
-  // Kontrole za grupe unutar large_full_final.glb (12 grupa):
+  glbFile: string;
+  // Kontrole za grupe unutar large_full_modul.glb (17 grupa):
   hasKonstrukcija: boolean;
   hasStakleniKrov: boolean;
   hasFasada2PunZid: boolean;
@@ -40,6 +52,12 @@ interface PlacedModule {
   hasFasada3PunZid: boolean;
   hasKrovPun: boolean;
   hasFasada4PunZid: boolean;
+  // _R (desna strana) — samo large_full_modul.glb:
+  hasFasada1SaVratimaR: boolean;
+  hasFasada1BezVrataR: boolean;
+  hasFasada1PunZidR: boolean;
+  hasFasada3ProzorSpavacaR: boolean;
+  hasFasada3PunZidR: boolean;
   // Polja za medium tip (small_v2_full.glb):
   hasFasada1PodiznoKlizna: boolean;
   hasFasada1Fix: boolean;
@@ -48,6 +66,13 @@ interface PlacedModule {
   hasFasada3PodiznoKlizna: boolean;
   hasFasada3Fix: boolean;
   hasFasada1PunZid: boolean;
+  // Polja za deck tip (large_full_large_deck.glb):
+  hasTerasaDeckOtkrivena: boolean;
+  hasTerasaVelikaPergola: boolean;
+  // Polja za smalldeck tip (large_full_small_deck.glb):
+  hasTerasaDeckMala: boolean;
+  hasMalaPergolaDesnagore: boolean;
+  hasMalaPergolaLevaGore: boolean;
   col:     number;
   row:     number;
   /** 0=eave-left 1=eave-top 2=eave-right 3=eave-bottom (all large only) */
@@ -69,7 +94,7 @@ interface DragState {
 // ---------------------------------------------------------------------------
 function moduleSize(m: PlacedModule): { w: number; h: number } {
   // Small modul je uvek 1x1
-  if (m.type === 'small' || m.type === 'medium') {
+  if (m.type === 'small' || m.type === 'medium' || m.type === 'smalldeck') {
     return { w: 1, h: 1 };
   }
   // Large modul ima rotation-dependent footprint
@@ -124,9 +149,222 @@ function generateLayout(smallCount: number, largeCount: number, tallCount: numbe
 // ---------------------------------------------------------------------------
 // Scene3D — Three.js 3D preview
 // ---------------------------------------------------------------------------
-function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: number; rows: number }) {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+
+/** Procedural canvas texture for each ground type */
+function createGroundTexture(type: GrassType): THREE.CanvasTexture {
+  const SIZE = 512;
+  const canvas = document.createElement('canvas');
+  canvas.width = SIZE;
+  canvas.height = SIZE;
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.createImageData(SIZE, SIZE);
+  const d = img.data;
+
+  // Deterministic hash noise (no external deps)
+  const h  = (x: number, y: number, s = 0) => { const n = Math.sin(x * 127.1 + y * 311.7 + s * 74.3) * 43758.5453; return n - Math.floor(n); };
+  const bi = (x: number, y: number, s = 0) => { const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi, ux = fx*fx*(3-2*fx), uy = fy*fy*(3-2*fy); return h(xi,yi,s)*(1-ux)*(1-uy)+h(xi+1,yi,s)*ux*(1-uy)+h(xi,yi+1,s)*(1-ux)*uy+h(xi+1,yi+1,s)*ux*uy; };
+  const fbm = (x: number, y: number, s = 0) => bi(x,y,s)*0.50 + bi(x*2,y*2,s+7)*0.25 + bi(x*4,y*4,s+13)*0.125 + bi(x*8,y*8,s+19)*0.0625;
+  const cl  = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+
+  // Base pixel noise layer
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const idx = (y * SIZE + x) * 4;
+      const n  = fbm(x / 64, y / 64);
+      const n2 = bi(x / 20, y / 20, 3);
+      let r = 0, g = 0, b = 0;
+      if (type === 'trava') {
+        r = cl(38  + n*38  + n2*18); g = cl(95  + n*60  + n2*28); b = cl(22  + n*18);
+      } else if (type === 'suva') {
+        r = cl(158 + n*50  + n2*22); g = cl(128 + n*42  + n2*15); b = cl(55  + n*22);
+      } else if (type === 'zemlja') {
+        r = cl(95  + n*45  + n2*20); g = cl(60  + n*28  + n2*12); b = cl(25  + n*15);
+      } else if (type === 'pesak') {
+        r = cl(205 + n*28  + n2*12); g = cl(182 + n*26  + n2*10); b = cl(112 + n*22);
+      } else {  // beton
+        const gr = cl(148 + n*28 + n2*14);
+        r = gr; g = gr; b = gr;
+      }
+      d[idx]=r; d[idx+1]=g; d[idx+2]=b; d[idx+3]=255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  // Detail overlay per type
+  ctx.save();
+  if (type === 'trava') {
+    for (let i = 0; i < 3500; i++) {
+      const bx = h(i,0,20)*SIZE, by = h(i,0,21)*SIZE;
+      const len = 4 + h(i,0,22)*10;
+      const ang = -Math.PI/2 + (h(i,0,23)-0.5)*1.3;
+      ctx.strokeStyle = `rgba(${cl(18+h(i,0,24)*40)},${cl(65+h(i,0,25)*75)},${cl(6+h(i,0,26)*22)},0.55)`;
+      ctx.lineWidth = 0.4 + h(i,0,27)*0.7;
+      ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx+Math.cos(ang)*len, by+Math.sin(ang)*len); ctx.stroke();
+    }
+  } else if (type === 'suva') {
+    for (let i = 0; i < 2800; i++) {
+      const bx = h(i,1,30)*SIZE, by = h(i,1,31)*SIZE;
+      const len = 5 + h(i,1,32)*14;
+      const ang = (h(i,1,33)-0.5)*Math.PI*0.5;
+      ctx.strokeStyle = `rgba(${cl(160+h(i,1,34)*55)},${cl(110+h(i,1,35)*45)},${cl(22+h(i,1,36)*32)},0.45)`;
+      ctx.lineWidth = 0.4 + h(i,1,37)*0.6;
+      ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx+Math.cos(ang)*len, by+Math.sin(ang)*len); ctx.stroke();
+    }
+  } else if (type === 'zemlja') {
+    for (let i = 0; i < 350; i++) {
+      const bx = h(i,2,40)*SIZE, by = h(i,2,41)*SIZE;
+      const rr = 1.2 + h(i,2,42)*3.5;
+      const lum = 50 + Math.round(h(i,2,43)*65);
+      ctx.beginPath();
+      ctx.ellipse(bx, by, rr, rr*(0.55+h(i,2,44)*0.55), h(i,2,45)*Math.PI, 0, Math.PI*2);
+      ctx.fillStyle = `rgba(${lum+28},${lum},${lum-18},0.65)`;
+      ctx.fill();
+    }
+  } else if (type === 'pesak') {
+    for (let row = 0; row < 35; row++) {
+      const baseY = row*(SIZE/35) + h(row,3,50)*6;
+      ctx.beginPath(); ctx.moveTo(0, baseY);
+      for (let xi = 0; xi <= SIZE; xi += 3) {
+        ctx.lineTo(xi, baseY + bi(xi/40, row/6, 55)*7-3.5);
+      }
+      ctx.strokeStyle = 'rgba(165,138,72,0.14)'; ctx.lineWidth = 0.9; ctx.stroke();
+    }
+  } else {
+    // Concrete: expansion joint grid
+    const sl = SIZE/4;
+    ctx.strokeStyle = 'rgba(70,70,70,0.38)'; ctx.lineWidth = 1.8;
+    for (let i = 1; i < 4; i++) {
+      ctx.beginPath(); ctx.moveTo(i*sl,0); ctx.lineTo(i*sl,SIZE); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0,i*sl); ctx.lineTo(SIZE,i*sl); ctx.stroke();
+    }
+    // Fine surface cracks
+    for (let i = 0; i < 10; i++) {
+      ctx.beginPath(); ctx.moveTo(h(i,4,60)*SIZE, h(i,4,61)*SIZE);
+      let cx2 = h(i,4,60)*SIZE, cy2 = h(i,4,61)*SIZE;
+      for (let seg = 0; seg < 6; seg++) { cx2+=(h(i,seg,62)-0.5)*18; cy2+=(h(i,seg,63)-0.5)*18; ctx.lineTo(cx2,cy2); }
+      ctx.strokeStyle = 'rgba(55,55,55,0.18)'; ctx.lineWidth = 0.5; ctx.stroke();
+    }
+  }
+  ctx.restore();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(45, 45);
+  return tex;
+}
+
+const GRASS_COLORS: Record<GrassType, number> = {
+  trava:  0x9aab8c,
+  suva:   0xb8a96a,
+  zemlja: 0x7a5c3a,
+  pesak:  0xd4c08a,
+  beton:  0xaaaaaa,
+};
+
+function Scene3D({ modules, cols, rows, lightSettings, sceneSettings }: {
+  modules: PlacedModule[];
+  cols: number;
+  rows: number;
+  lightSettings: LightSettings;
+  sceneSettings: SceneSettings;
+}) {
+  const mountRef     = useRef<HTMLDivElement>(null);
+  const rendererRef  = useRef<THREE.WebGLRenderer | null>(null);
+  const dirLightRef  = useRef<THREE.DirectionalLight | null>(null);
+  const hemiLightRef = useRef<THREE.HemisphereLight  | null>(null);
+  const fillLightRef = useRef<THREE.DirectionalLight | null>(null);
+  const sceneRef     = useRef<THREE.Scene            | null>(null);
+  const floorMatRef  = useRef<THREE.MeshStandardMaterial | null>(null);
+  const floorSizeRef = useRef(80);
+  const centerXRef   = useRef(0);
+  const centerZRef   = useRef(0);
+  const lightSettingsRef  = useRef(lightSettings);
+  const sceneSettingsRef  = useRef(sceneSettings);
+  lightSettingsRef.current = lightSettings;
+  sceneSettingsRef.current = sceneSettings;
+
+  const applyLighting = useCallback((ls: LightSettings) => {
+    const dirLight  = dirLightRef.current;
+    const hemi      = hemiLightRef.current;
+    const fillLight = fillLightRef.current;
+    const renderer  = rendererRef.current;
+    const scene     = sceneRef.current;
+    if (!dirLight || !hemi || !fillLight || !renderer || !scene) return;
+    const cX = centerXRef.current;
+    const cZ = centerZRef.current;
+    const elevRad = (ls.sunElevation * Math.PI) / 180;
+    const azRad   = (ls.sunAngle     * Math.PI) / 180;
+    const dist    = 70;
+    const hDist   = dist * Math.cos(elevRad);
+    const lx = cX + Math.sin(azRad) * hDist;
+    const ly = dist * Math.sin(elevRad);
+    const lz = cZ - Math.cos(azRad) * hDist;
+    if (ls.isDay) {
+      renderer.toneMappingExposure = 1.4;
+      (scene.background as THREE.Color).setHex(0x87ceeb);
+      (scene.fog as THREE.FogExp2).color.setHex(0xb0d8f0);
+      (scene.fog as THREE.FogExp2).density = 0.003;
+      hemi.color.setHex(0xb0d4ff);
+      hemi.groundColor.setHex(0x8a9a70);
+      hemi.intensity = 1.2;
+      dirLight.color.setHex(0xfff8e7);
+      dirLight.intensity = 3.5;
+      dirLight.position.set(lx, ly, lz);
+      fillLight.color.setHex(0xd0e8ff);
+      fillLight.intensity = 1.2;
+      fillLight.position.set(cX - Math.sin(azRad) * 35, 25, cZ + Math.cos(azRad) * 35);
+    } else {
+      renderer.toneMappingExposure = 0.7;
+      (scene.background as THREE.Color).setHex(0x050d1a);
+      (scene.fog as THREE.FogExp2).color.setHex(0x050d1a);
+      (scene.fog as THREE.FogExp2).density = 0.005;
+      hemi.color.setHex(0x1a2a4a);
+      hemi.groundColor.setHex(0x050508);
+      hemi.intensity = 0.25;
+      dirLight.color.setHex(0xb0c8e8);
+      dirLight.intensity = 0.7;
+      dirLight.position.set(lx, ly, lz);
+      fillLight.color.setHex(0x1a2a4a);
+      fillLight.intensity = 0.15;
+      fillLight.position.set(cX - Math.sin(azRad) * 35, 25, cZ + Math.cos(azRad) * 35);
+    }
+    dirLight.shadow.camera.updateProjectionMatrix();
+  }, []);
+
+  const applyScene = useCallback((ss: SceneSettings) => {
+    const mat   = floorMatRef.current;
+    const scene = sceneRef.current;
+    if (!mat || !scene) return;
+    if (mat.map) { mat.map.dispose(); mat.map = null; }
+    if (ss.grass === 'trava') {
+      const tex = new THREE.TextureLoader().load('/grass.jpg', (t) => {
+        const repeats = floorSizeRef.current / 5;
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        t.repeat.set(repeats, repeats);
+        t.colorSpace = THREE.SRGBColorSpace;
+        mat.map = t;
+        mat.color.setHex(0xffffff);
+        mat.roughness = 0.85;
+        mat.needsUpdate = true;
+      });
+      void tex;
+    } else {
+      mat.map = createGroundTexture(ss.grass);
+      mat.color.setHex(0xffffff);
+    }
+    const roughnessMap: Record<GrassType, number> = { trava: 0.92, suva: 0.88, zemlja: 0.95, pesak: 0.78, beton: 0.65 };
+    mat.roughness = roughnessMap[ss.grass];
+    mat.needsUpdate = true;
+    (scene.fog as THREE.FogExp2).density = ss.fogEnabled ? 0.003 : 0;
+  }, []);
+
+  useEffect(() => {
+    applyLighting(lightSettings);
+  }, [lightSettings, applyLighting]);
+
+  useEffect(() => {
+    applyScene(sceneSettings);
+  }, [sceneSettings, applyScene]);
 
   useEffect(() => {
     const mount = mountRef.current!;
@@ -143,15 +381,15 @@ function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: numbe
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.0;
+    renderer.toneMappingExposure = 1.4;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.setClearColor(0x1b3458);
+    renderer.setClearColor(0x87ceeb);
     mount.appendChild(renderer.domElement);
 
     // Scene
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1b3458);
-    scene.fog = new THREE.FogExp2(0x1b3458, 0.006);
+    scene.background = new THREE.Color(0x87ceeb);
+    scene.fog = new THREE.FogExp2(0xb0d8f0, 0.003);
 
     // Compute center from placed modules (or fall back to grid centre)
     let centerX: number, centerZ: number;
@@ -176,42 +414,54 @@ function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: numbe
     camera.position.set(centerX, 22, centerZ + 28);
     camera.lookAt(centerX, 0, centerZ);
 
-    // Lights
-    const hemi = new THREE.HemisphereLight(0x3464a0, 0x1a1a28, 0.7);
+    // Lights — colors & positions applied dynamically via applyLighting()
+    const hemi = new THREE.HemisphereLight(0xb0d4ff, 0x8a9a70, 1.2);
     scene.add(hemi);
 
-    const dirLight = new THREE.DirectionalLight(0xfff5e8, 2.0);
-    dirLight.position.set(centerX + 20, 35, centerZ - 10);
+    const dirLight = new THREE.DirectionalLight(0xfff8e7, 3.5);
     dirLight.castShadow = true;
-    dirLight.shadow.mapSize.width  = 2048;
-    dirLight.shadow.mapSize.height = 2048;
+    dirLight.shadow.mapSize.width  = 4096;
+    dirLight.shadow.mapSize.height = 4096;
     dirLight.shadow.camera.near   = 0.5;
-    dirLight.shadow.camera.far    = 200;
-    dirLight.shadow.camera.left   = -60;
-    dirLight.shadow.camera.right  =  60;
-    dirLight.shadow.camera.top    =  60;
-    dirLight.shadow.camera.bottom = -60;
+    dirLight.shadow.camera.far    = 300;
+    dirLight.shadow.camera.left   = -80;
+    dirLight.shadow.camera.right  =  80;
+    dirLight.shadow.camera.top    =  80;
+    dirLight.shadow.camera.bottom = -80;
+    dirLight.shadow.bias = -0.0003;
     scene.add(dirLight);
 
-    const fillLight = new THREE.DirectionalLight(0x6a90c0, 0.9);
-    fillLight.position.set(centerX - 20, 18, centerZ + 20);
+    const fillLight = new THREE.DirectionalLight(0xd0e8ff, 1.2);
     scene.add(fillLight);
 
+    // Store refs & apply current lighting
+    hemiLightRef.current  = hemi;
+    dirLightRef.current   = dirLight;
+    fillLightRef.current  = fillLight;
+    sceneRef.current      = scene;
+    centerXRef.current    = centerX;
+    centerZRef.current    = centerZ;
+    applyLighting(lightSettingsRef.current);
+
     // Floor
-    const floorGeo = new THREE.PlaneGeometry(cols * 2.4 + 60, rows * 2.4 + 60);
-    const floorMat = new THREE.MeshStandardMaterial({ color: 0x232330, roughness: 0.88, metalness: 0.05 });
+    const floorSize = cols * 2.4 + 60;
+    floorSizeRef.current = floorSize;
+    const floorGeo = new THREE.PlaneGeometry(floorSize, floorSize);
+    const floorMat = new THREE.MeshStandardMaterial({ roughness: 0.9, metalness: 0.0 });
+    floorMatRef.current = floorMat;
     const floor = new THREE.Mesh(floorGeo, floorMat);
     floor.rotation.x = -Math.PI / 2;
     floor.position.set(centerX, 0, centerZ);
     floor.receiveShadow = true;
     scene.add(floor);
+    applyScene(sceneSettingsRef.current);
 
     // Grid lines
     const gridHelper = new THREE.GridHelper(
       Math.max(cols, rows) * 2.4 + 10,
       Math.max(cols, rows) + 4,
-      0x2d2d3c,
-      0x272732,
+      0x6a7c5a,
+      0x7a8e68,
     );
     gridHelper.position.set(centerX, 0.01, centerZ);
     scene.add(gridHelper);
@@ -231,7 +481,7 @@ function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: numbe
         moduleGroup.name = `module-${m.id}`;
         
         // Fiksne dimenzije - zavisi od tipa modula
-        const FIXED_WIDTH = m.type === 'large' ? 4.8 : 2.4;  // Large: 2 ćelije (4.8m), Small: 1 ćelija (2.4m)
+        const FIXED_WIDTH = (m.type === 'large' || m.type === 'deck') ? 4.8 : 2.4;  // Large/Deck: 2 ćelije (4.8m), Small/Medium/SmallDeck: 1 ćelija (2.4m)
         const FIXED_DEPTH = m.type === 'large' ? 2.4 : 2.4;  // Large: 1 ćelija (2.4m), Small: 1 ćelija (2.4m)
         
         // Izračunaj grid poziciju
@@ -246,7 +496,7 @@ function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: numbe
         // Učitaj GLB fajl (large_full.glb ili small_full.glb)
         loader.load(`/modules/${m.glbFile}`, (gltf) => {
           const modulModel = gltf.scene.clone();
-          modulModel.name = m.type === 'large' ? 'large-full' : m.type === 'medium' ? 'medium-full' : 'small-full';
+          modulModel.name = m.type === 'large' ? 'large-full' : m.type === 'deck' ? 'deck-full' : m.type === 'smalldeck' ? 'smalldeck-full' : m.type === 'medium' ? 'medium-full' : 'small-full';
           
           // Pronađi sve grupe po imenu (12 grupa)
           const konstrukcijaGroup = modulModel.getObjectByName('konstrukcija');
@@ -269,6 +519,19 @@ function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: numbe
           const fasada3PodiznoKliznaGroup = modulModel.getObjectByName('fasada_3_podizno_klizniiiiiii');
           const fasada3FixGroup = modulModel.getObjectByName('fasada_3_fix');
           const fasada1PunZidGroup = modulModel.getObjectByName('fasada_1_pun_zid');
+          // Large _R groups (large_full_modul.glb — desna strana)
+          const fasada1SaVratimaRGroup = modulModel.getObjectByName('fasada_1_sa_vratima_R');
+          const fasada1BezVrataRGroup  = modulModel.getObjectByName('fasada_1_bez_vrata_R');
+          const fasada1PunZidRGroup    = modulModel.getObjectByName('fasada_1_pun_zid_R');
+          const fasada3ProzorSpavacaRGroup = modulModel.getObjectByName('fasada_3_prozor_spavaca_R');
+          const fasada3PunZidRGroup    = modulModel.getObjectByName('fasada_3_pun_zid_R');
+          // Deck-specific groups (large_full_large_deck.glb)
+          const terasaDeckOtkrivenaGroup = modulModel.getObjectByName('terasa_deck_otkrivena');
+          const terasaVelikaPergolaGroup = modulModel.getObjectByName('terasa_velika_pergola');
+          // SmallDeck-specific groups (large_full_small_deck.glb)
+          const terasaDeckMalaGroup = modulModel.getObjectByName('terasa_deck_mala');
+          const malaPergolaDesnagoreGroup = modulModel.getObjectByName('mala_pergola_desna_gore');
+          const malaPergolaLevaGoreGroup = modulModel.getObjectByName('mala_pergola_leva_gore');
           
           // Izmeri model
           const bbox = new THREE.Box3().setFromObject(modulModel);
@@ -313,8 +576,16 @@ function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: numbe
           if (fasada3PodiznoKliznaGroup) fasada3PodiznoKliznaGroup.visible = m.hasFasada3PodiznoKlizna;
           if (fasada3FixGroup) fasada3FixGroup.visible = m.hasFasada3Fix;
           if (fasada1PunZidGroup) fasada1PunZidGroup.visible = m.hasFasada1PunZid;
-          
-          // Setup senki
+          if (fasada1SaVratimaRGroup) fasada1SaVratimaRGroup.visible = m.hasFasada1SaVratimaR;
+          if (fasada1BezVrataRGroup)  fasada1BezVrataRGroup.visible  = m.hasFasada1BezVrataR;
+          if (fasada1PunZidRGroup)    fasada1PunZidRGroup.visible    = m.hasFasada1PunZidR;
+          if (fasada3ProzorSpavacaRGroup) fasada3ProzorSpavacaRGroup.visible = m.hasFasada3ProzorSpavacaR;
+          if (fasada3PunZidRGroup)    fasada3PunZidRGroup.visible    = m.hasFasada3PunZidR;
+          if (terasaDeckOtkrivenaGroup) terasaDeckOtkrivenaGroup.visible = m.hasTerasaDeckOtkrivena;
+          if (terasaVelikaPergolaGroup) terasaVelikaPergolaGroup.visible = m.hasTerasaVelikaPergola;
+          if (terasaDeckMalaGroup) terasaDeckMalaGroup.visible = m.hasTerasaDeckMala;
+          if (malaPergolaDesnagoreGroup) malaPergolaDesnagoreGroup.visible = m.hasMalaPergolaDesnagore;
+          if (malaPergolaLevaGoreGroup) malaPergolaLevaGoreGroup.visible = m.hasMalaPergolaLevaGore;
           modulModel.traverse((child) => {
             if ((child as THREE.Mesh).isMesh) {
               child.castShadow = true;
@@ -374,6 +645,12 @@ function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: numbe
       renderer.dispose();
       customMeshes.forEach(obj => scene.remove(obj));
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
+      dirLightRef.current  = null;
+      hemiLightRef.current = null;
+      fillLightRef.current = null;
+      floorMatRef.current  = null;
+      sceneRef.current     = null;
+      rendererRef.current  = null;
     };
   // Re-init when modules, cols, or rows change
   }, [modules, cols, rows]);
@@ -393,16 +670,33 @@ export default function Home() {
   const [drag,    setDrag]    = useState<DragState | null>(null);
   const [zoom,    setZoom]    = useState(1);
   const [view,    setView]    = useState<'2d' | '3d'>('2d');
+  const [lightSettings, setLightSettings] = useState<LightSettings>({ isDay: true, sunAngle: 63, sunElevation: 53 });
+  const [sceneSettings, setSceneSettings] = useState<SceneSettings>({ grass: 'trava', fogEnabled: true });
   const [cols,    setCols]    = useState(DEFAULT_COLS);
+
+  const sunDirectionLabel = (angle: number): string => {
+    const dirs = ['Sever', 'S-Istok', 'Istok', 'J-Istok', 'Jug', 'J-Zapad', 'Zapad', 'S-Zapad'];
+    return dirs[Math.round(((angle % 360) + 360) % 360 / 45) % 8];
+  };
   const [rows,    setRows]    = useState(DEFAULT_ROWS);
   const [genSmall, setGenSmall] = useState(2);
   const [genLarge, setGenLarge] = useState(4);
   const [genTall,  setGenTall]  = useState(0);
   
+  // Objekti modal
+  const [objektiModalOpen, setObjektiModalOpen] = useState(false);
+
   // Module options modal
   const [optionsModalOpen, setOptionsModalOpen] = useState(false);
   const [editingModuleId, setEditingModuleId] = useState<string | null>(null);
-  
+
+  // Preview 3D mini-scena u modalu
+  const previewMountRef    = useRef<HTMLDivElement>(null);
+  const previewRendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const previewAnimIdRef   = useRef<number>(0);
+  const previewModelRef    = useRef<THREE.Object3D | null>(null);
+  const previewSceneRef    = useRef<THREE.Scene | null>(null);
+
   const gridRef   = useRef<HTMLDivElement>(null);
   const scrollRef  = useRef<HTMLDivElement>(null);
   const needsCenterRef = useRef(false);
@@ -424,6 +718,155 @@ export default function Home() {
     if (newRows !== rows) setRows(newRows);
   }, [modules, cols, rows]);
 
+  // ── PREVIEW 3D — inicijalizacija kad se modal otvori ──────────────────────
+  useEffect(() => {
+    if (!optionsModalOpen || !editingModuleId) return;
+    const mount = previewMountRef.current;
+    if (!mount) return;
+
+    const editingMod = modules.find(m => m.id === editingModuleId);
+    if (!editingMod) return;
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d0d14);
+    previewSceneRef.current = scene;
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0x87ceeb, 0x334455, 1.4);
+    scene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xfff4e0, 2.2);
+    sun.position.set(6, 10, 8);
+    scene.add(sun);
+    const fill = new THREE.DirectionalLight(0x9bb4d0, 0.6);
+    fill.position.set(-5, 4, -6);
+    scene.add(fill);
+
+    // Camera
+    const w = mount.clientWidth;
+    const h = mount.clientHeight;
+    const camera = new THREE.PerspectiveCamera(42, w / h, 0.1, 200);
+    camera.position.set(5, 4, 6);
+    camera.lookAt(0, 1, 0);
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(w, h);
+    renderer.shadowMap.enabled = false;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.3;
+    mount.appendChild(renderer.domElement);
+    previewRendererRef.current = renderer;
+
+    // OrbitControls
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.autoRotate = false;
+    controls.target.set(0, 1, 0);
+    controls.minDistance = 2;
+    controls.maxDistance = 30;
+    controls.maxPolarAngle = Math.PI / 2 - 0.02;
+    controls.update();
+
+    // Load GLB
+    const loader = new GLTFLoader();
+    loader.load(`/modules/${editingMod.glbFile}`, (gltf) => {
+      const model = gltf.scene.clone();
+      // Scale to fit nicely
+      const bbox = new THREE.Box3().setFromObject(model);
+      const size = bbox.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const scale = 3.5 / maxDim;
+      model.scale.setScalar(scale);
+      model.updateMatrixWorld(true);
+      const bboxS = new THREE.Box3().setFromObject(model);
+      const center = bboxS.getCenter(new THREE.Vector3());
+      model.position.set(-center.x, -bboxS.min.y, -center.z);
+
+      // Apply current visibility
+      const applyVis = (mod: PlacedModule) => {
+        const g = (name: string) => model.getObjectByName(name);
+        if (g('konstrukcija')) g('konstrukcija')!.visible = mod.hasKonstrukcija;
+        if (g('stakleni_krov')) g('stakleni_krov')!.visible = mod.hasStakleniKrov;
+        if (g('fasada_2_pun_zid')) g('fasada_2_pun_zid')!.visible = mod.hasFasada2PunZid;
+        if (g('fasada_1_sa_vratima')) g('fasada_1_sa_vratima')!.visible = mod.hasFasada1SaVratima;
+        if (g('fasada_1_bez_vrata')) g('fasada_1_bez_vrata')!.visible = mod.hasFasada1BezVrata;
+        if (g('fasada_4_podizno_klizniiiiiii')) g('fasada_4_podizno_klizniiiiiii')!.visible = mod.hasFasada4PodiznoKlizna;
+        if (g('fasada_4_fix')) g('fasada_4_fix')!.visible = mod.hasFasada4Fix;
+        if (g('fasada_4_kupatilo_prozor')) g('fasada_4_kupatilo_prozor')!.visible = mod.hasFasada4KupatiloProzor;
+        if (g('fasada_3_prozor_spavaca')) g('fasada_3_prozor_spavaca')!.visible = mod.hasFasada3ProzorSpavaca;
+        if (g('fasada_3_pun_zid')) g('fasada_3_pun_zid')!.visible = mod.hasFasada3PunZid;
+        if (g('krov_pun')) g('krov_pun')!.visible = mod.hasKrovPun;
+        if (g('fasada_4_pun_zid')) g('fasada_4_pun_zid')!.visible = mod.hasFasada4PunZid;
+        if (g('fasada_1_podizno_klizniiiiiii')) g('fasada_1_podizno_klizniiiiiii')!.visible = mod.hasFasada1PodiznoKlizna;
+        if (g('fasada_1_fix')) g('fasada_1_fix')!.visible = mod.hasFasada1Fix;
+        if (g('fasada_2_podizno_klizniiiiiii')) g('fasada_2_podizno_klizniiiiiii')!.visible = mod.hasFasada2PodiznoKlizna;
+        if (g('fasada_2_fix')) g('fasada_2_fix')!.visible = mod.hasFasada2Fix;
+        if (g('fasada_3_podizno_klizniiiiiii')) g('fasada_3_podizno_klizniiiiiii')!.visible = mod.hasFasada3PodiznoKlizna;
+        if (g('fasada_3_fix')) g('fasada_3_fix')!.visible = mod.hasFasada3Fix;
+        if (g('fasada_1_pun_zid')) g('fasada_1_pun_zid')!.visible = mod.hasFasada1PunZid;
+        if (g('fasada_1_sa_vratima_R')) g('fasada_1_sa_vratima_R')!.visible = mod.hasFasada1SaVratimaR;
+        if (g('fasada_1_bez_vrata_R')) g('fasada_1_bez_vrata_R')!.visible = mod.hasFasada1BezVrataR;
+        if (g('fasada_1_pun_zid_R')) g('fasada_1_pun_zid_R')!.visible = mod.hasFasada1PunZidR;
+        if (g('fasada_3_prozor_spavaca_R')) g('fasada_3_prozor_spavaca_R')!.visible = mod.hasFasada3ProzorSpavacaR;
+        if (g('fasada_3_pun_zid_R')) g('fasada_3_pun_zid_R')!.visible = mod.hasFasada3PunZidR;
+        if (g('terasa_deck_otkrivena')) g('terasa_deck_otkrivena')!.visible = mod.hasTerasaDeckOtkrivena;
+        if (g('terasa_velika_pergola')) g('terasa_velika_pergola')!.visible = mod.hasTerasaVelikaPergola;
+        if (g('terasa_deck_mala')) g('terasa_deck_mala')!.visible = mod.hasTerasaDeckMala;
+        if (g('mala_pergola_desna_gore')) g('mala_pergola_desna_gore')!.visible = mod.hasMalaPergolaDesnagore;
+        if (g('mala_pergola_leva_gore')) g('mala_pergola_leva_gore')!.visible = mod.hasMalaPergolaLevaGore;
+      };
+      applyVis(editingMod);
+
+      // Expose applyVis so the visibility-update effect can call it
+      (model as any).__applyVis = applyVis;
+
+      scene.add(model);
+      previewModelRef.current = model;
+    });
+
+    // Render loop
+    const animate = () => {
+      previewAnimIdRef.current = requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    // Resize
+    const ro = new ResizeObserver(() => {
+      const rw = mount.clientWidth;
+      const rh = mount.clientHeight;
+      camera.aspect = rw / rh;
+      camera.updateProjectionMatrix();
+      renderer.setSize(rw, rh);
+    });
+    ro.observe(mount);
+
+    return () => {
+      cancelAnimationFrame(previewAnimIdRef.current);
+      ro.disconnect();
+      controls.dispose();
+      renderer.dispose();
+      if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
+      previewRendererRef.current = null;
+      previewModelRef.current = null;
+      previewSceneRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [optionsModalOpen, editingModuleId]);
+
+  // ── PREVIEW 3D — ažuriraj vidljivost kad se toggleovi menjaju ──────────────
+  useEffect(() => {
+    if (!optionsModalOpen || !editingModuleId) return;
+    const model = previewModelRef.current;
+    if (!model || !(model as any).__applyVis) return;
+    const mod = modules.find(m => m.id === editingModuleId);
+    if (mod) (model as any).__applyVis(mod);
+  });
+
   const changeZoom = (delta: number) =>
     setZoom(prev => parseFloat(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev + delta)).toFixed(2)));
 
@@ -433,7 +876,9 @@ export default function Home() {
     if (!pos) return; // grid full
     
     // Odaberi GLB fajl na osnovu tipa
-    const glbFile = type === 'large' ? 'large_full_final.glb' : type === 'medium' ? 'small_v2_full.glb' : 'small_full.glb';
+    const glbFile = type === 'large' ? 'large_full_modul.glb' : type === 'deck' ? 'large_full_large_deck.glb' : type === 'smalldeck' ? 'large_full_small_deck.glb' : type === 'medium' ? 'small_v2_full.glb' : 'small_full.glb';
+    const isDeck = type === 'deck';
+    const isSmallDeck = type === 'smalldeck';
     const isMedium = type === 'medium';
     const isSmall = type === 'small';
     const isLarge = type === 'large';
@@ -445,29 +890,50 @@ export default function Home() {
         type, 
         glbFile,
         hasKonstrukcija: true,
-        hasStakleniKrov: true,
-        hasFasada2PunZid: true,
-        hasFasada1SaVratima: isLarge,
-        hasFasada1BezVrata: isLarge,
-        hasFasada4PodiznoKlizna: true,
-        hasFasada4Fix: true,
-        hasFasada4KupatiloProzor: isLarge,
-        hasFasada3ProzorSpavaca: isLarge,
-        hasFasada3PunZid: true,
-        hasKrovPun: true,
-        hasFasada4PunZid: true,
-        hasFasada1PodiznoKlizna: isMedium || isSmall,
-        hasFasada1Fix: isMedium || isSmall,
-        hasFasada2PodiznoKlizna: isMedium || isSmall,
-        hasFasada2Fix: isMedium || isSmall,
-        hasFasada3PodiznoKlizna: isMedium || isSmall,
-        hasFasada3Fix: isMedium || isSmall,
-        hasFasada1PunZid: isMedium || isSmall,
+        hasStakleniKrov: false,
+        hasFasada2PunZid: false,
+        hasFasada1SaVratima: false,
+        hasFasada1BezVrata: false,
+        hasFasada4PodiznoKlizna: false,
+        hasFasada4Fix: false,
+        hasFasada4KupatiloProzor: false,
+        hasFasada3ProzorSpavaca: false,
+        hasFasada3PunZid: false,
+        hasKrovPun: false,
+        hasFasada4PunZid: false,
+        hasFasada1SaVratimaR: false,
+        hasFasada1BezVrataR: false,
+        hasFasada1PunZidR: false,
+        hasFasada3ProzorSpavacaR: false,
+        hasFasada3PunZidR: false,
+        hasFasada1PodiznoKlizna: false,
+        hasFasada1Fix: false,
+        hasFasada2PodiznoKlizna: false,
+        hasFasada2Fix: false,
+        hasFasada3PodiznoKlizna: false,
+        hasFasada3Fix: false,
+        hasFasada1PunZid: false,
+        hasTerasaDeckOtkrivena: false,
+        hasTerasaVelikaPergola: false,
+        hasTerasaDeckMala: false,
+        hasMalaPergolaDesnagore: false,
+        hasMalaPergolaLevaGore: false,
         col: pos.col, 
         row: pos.row, 
         rotation: 0 
       },
     ]);
+  };
+
+  // ---- Duplicate module ----
+  const duplicateModule = (id: string) => {
+    setModules(prev => {
+      const src = prev.find(m => m.id === id);
+      if (!src) return prev;
+      const pos = firstFreePosition(src.type, src.rotation, prev, cols, rows);
+      if (!pos) return prev;
+      return [...prev, { ...src, id: crypto.randomUUID(), col: pos.col, row: pos.row }];
+    });
   };
 
   // ---- Remove module ----
@@ -481,7 +947,9 @@ export default function Home() {
       prev.map(m => {
         if (m.id !== id) return m;
         const rotation = ((m.rotation + 1) % 4) as 0 | 1 | 2 | 3;
-        const newSize  = rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 };
+        // 1x1 moduli (small, medium, deck, smalldeck) ostaju iste velicine bez obzira na rotaciju
+        const is1x1 = m.type === 'small' || m.type === 'medium' || m.type === 'deck' || m.type === 'smalldeck';
+        const newSize = is1x1 ? { w: 1, h: 1 } : (rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 });
         const col      = Math.min(m.col, cols - newSize.w);
         const row      = Math.min(m.row, rows - newSize.h);
         const updated  = { ...m, rotation, col, row };
@@ -529,6 +997,22 @@ export default function Home() {
   const toggleFasada4PunZid = (id: string) => {
     setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada4PunZid: !m.hasFasada4PunZid } : m));
   };
+  // _R (desna strana) — samo large_full_modul.glb
+  const toggleFasada1SaVratimaR = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1SaVratimaR: !m.hasFasada1SaVratimaR } : m));
+  };
+  const toggleFasada1BezVrataR = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1BezVrataR: !m.hasFasada1BezVrataR } : m));
+  };
+  const toggleFasada1PunZidR = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1PunZidR: !m.hasFasada1PunZidR } : m));
+  };
+  const toggleFasada3ProzorSpavacaR = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada3ProzorSpavacaR: !m.hasFasada3ProzorSpavacaR } : m));
+  };
+  const toggleFasada3PunZidR = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada3PunZidR: !m.hasFasada3PunZidR } : m));
+  };
 
   // ---- Toggle grupe iz small_v2_full.glb (medium tip) ----
   const toggleFasada1PodiznoKlizna = (id: string) => {
@@ -551,6 +1035,25 @@ export default function Home() {
   };
   const toggleFasada1PunZid = (id: string) => {
     setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1PunZid: !m.hasFasada1PunZid } : m));
+  };
+
+  // ---- Toggle grupe iz large_full_large_deck.glb (deck tip) ----
+  const toggleTerasaDeckOtkrivena = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasTerasaDeckOtkrivena: !m.hasTerasaDeckOtkrivena } : m));
+  };
+  const toggleTerasaVelikaPergola = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasTerasaVelikaPergola: !m.hasTerasaVelikaPergola } : m));
+  };
+
+  // ---- Toggle grupe iz large_full_small_deck.glb (smalldeck tip) ----
+  const toggleTerasaDeckMala = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasTerasaDeckMala: !m.hasTerasaDeckMala } : m));
+  };
+  const toggleMalaPergolaDesnagore = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasMalaPergolaDesnagore: !m.hasMalaPergolaDesnagore } : m));
+  };
+  const toggleMalaPergolaLevaGore = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasMalaPergolaLevaGore: !m.hasMalaPergolaLevaGore } : m));
   };
 
   // Open options modal
@@ -635,9 +1138,19 @@ export default function Home() {
         svgLabel = activeCount === 0 ? 'PRAZAN' : activeCount === 15 ? 'KOMPLETAN' : `${activeCount}/15`;
         svgFill = m.type === 'medium' ? '#f97316' : '#3b82f6';
         svgStroke = m.type === 'medium' ? '#ea580c' : '#2563eb';
+      } else if (m.type === 'deck') {
+        const activeCount = [m.hasTerasaDeckOtkrivena, m.hasTerasaVelikaPergola].filter(Boolean).length;
+        svgLabel = activeCount === 0 ? 'PRAZAN' : activeCount === 2 ? 'KOMPLETAN' : `${activeCount}/2`;
+        svgFill = '#14b8a6';
+        svgStroke = '#0d9488';
+      } else if (m.type === 'smalldeck') {
+        const activeCount = [m.hasTerasaDeckMala, m.hasMalaPergolaDesnagore, m.hasMalaPergolaLevaGore].filter(Boolean).length;
+        svgLabel = activeCount === 0 ? 'PRAZAN' : activeCount === 3 ? 'KOMPLETAN' : `${activeCount}/3`;
+        svgFill = '#06b6d4';
+        svgStroke = '#0891b2';
       } else {
-        const activeCount = [m.hasKonstrukcija, m.hasStakleniKrov, m.hasFasada2PunZid, m.hasFasada1SaVratima, m.hasFasada1BezVrata, m.hasFasada4PodiznoKlizna, m.hasFasada4Fix, m.hasFasada4KupatiloProzor, m.hasFasada3ProzorSpavaca, m.hasFasada3PunZid, m.hasKrovPun, m.hasFasada4PunZid].filter(Boolean).length;
-        svgLabel = activeCount === 0 ? 'PRAZAN' : activeCount === 12 ? 'KOMPLETAN' : `${activeCount}/12`;
+        const activeCount = [m.hasKonstrukcija, m.hasStakleniKrov, m.hasFasada2PunZid, m.hasFasada1SaVratima, m.hasFasada1BezVrata, m.hasFasada4PodiznoKlizna, m.hasFasada4Fix, m.hasFasada4KupatiloProzor, m.hasFasada3ProzorSpavaca, m.hasFasada3PunZid, m.hasKrovPun, m.hasFasada4PunZid, m.hasFasada1SaVratimaR, m.hasFasada1BezVrataR, m.hasFasada1PunZidR, m.hasFasada3ProzorSpavacaR, m.hasFasada3PunZidR].filter(Boolean).length;
+        svgLabel = activeCount === 0 ? 'PRAZAN' : activeCount === 17 ? 'KOMPLETAN' : `${activeCount}/17`;
         svgFill = '#22c55e'; 
         svgStroke = '#16a34a';
       }
@@ -1016,20 +1529,55 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               }}
             >
               <span style={{ fontSize: 18, lineHeight: 1, fontWeight: 200, color: 'rgba(253,186,116,0.6)', marginBottom: 1 }}>+</span>
-              <span>Veliki modul</span>
+              <span>Visoki modul</span>
+            </button>
+
+            <button
+              onClick={() => addModule('deck')}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                background: 'rgba(20,184,166,0.15)', border: '1px solid rgba(20,184,166,0.35)',
+                borderRadius: 8, padding: '6px 11px',
+                color: 'rgba(94,234,212,0.95)', cursor: 'pointer',
+                fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s',
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(20,184,166,0.25)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(20,184,166,0.15)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(94,234,212,0.95)';
+              }}
+            >
+              <span style={{ fontSize: 18, lineHeight: 1, fontWeight: 200, color: 'rgba(94,234,212,0.6)', marginBottom: 1 }}>+</span>
+              <span>Velika Terasa</span>
+            </button>
+
+            <button
+              onClick={() => addModule('smalldeck')}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                background: 'rgba(6,182,212,0.15)', border: '1px solid rgba(6,182,212,0.35)',
+                borderRadius: 8, padding: '6px 11px',
+                color: 'rgba(103,232,249,0.95)', cursor: 'pointer',
+                fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s',
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(6,182,212,0.25)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(6,182,212,0.15)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(103,232,249,0.95)';
+              }}
+            >
+              <span style={{ fontSize: 18, lineHeight: 1, fontWeight: 200, color: 'rgba(103,232,249,0.6)', marginBottom: 1 }}>+</span>
+              <span>Mala Terasa</span>
             </button>
           </div>
-        </div>
-
-        {/* ── Center: GLB Mode Label (absolutely centered) ── */}
-        <div style={{
-          position: 'absolute', left: '50%', top: '50%',
-          transform: 'translate(-50%, -50%)',
-          display: 'flex', alignItems: 'center', gap: 8,
-          background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)',
-          borderRadius: 8, padding: '6px 16px',
-        }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: 'rgba(180,180,255,0.9)', letterSpacing: '0.02em' }}>GLB Mode</span>
         </div>
 
         {/* Hidden generator controls - keep for backward compatibility */}
@@ -1316,31 +1864,6 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         flexShrink: 0,
         fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif',
       }}>
-        {/* Module counts */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', flexShrink: 0, display: 'block' }} />
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Moduli</span>
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.length}</span>
-        </div>
-        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 12px' }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f97316', flexShrink: 0, display: 'block' }} />
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Konstrukcija</span>
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.filter(m => m.hasKonstrukcija).length}</span>
-        </div>
-        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 12px' }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#3b82f6', flexShrink: 0, display: 'block' }} />
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Krov pun</span>
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.filter(m => m.hasKrovPun).length}</span>
-        </div>
-        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 12px' }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#14b8a6', flexShrink: 0, display: 'block' }} />
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Stakleni krov</span>
-          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.filter(m => m.hasStakleniKrov).length}</span>
-        </div>
-        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 22px' }} />
         {/* Gabarit */}
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
           <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.07em', textTransform: 'uppercase' as const, fontWeight: 500 }}>Gabarit</span>
@@ -1366,6 +1889,25 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         {view === '3d' && (
           <>
             <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 22px' }} />
+            <button
+              onClick={() => setObjektiModalOpen(true)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: 'rgba(99,102,241,0.15)', border: '1px solid rgba(99,102,241,0.35)',
+                borderRadius: 7, padding: '0 12px', height: 26, cursor: 'pointer',
+                color: 'rgba(180,180,255,0.9)', fontSize: 12, fontWeight: 600,
+              }}
+              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(99,102,241,0.28)'; }}
+              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(99,102,241,0.15)'; }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                <line x1="12" y1="22.08" x2="12" y2="12"/>
+              </svg>
+              Objekti
+            </button>
+            <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 10px 0 0' }} />
             <button
               onClick={() => { const r = (document.querySelector('canvas') as HTMLCanvasElement); if (!r) return; const a = document.createElement('a'); a.href = r.toDataURL('image/png'); a.download = `modular-${Date.now()}.png`; a.click(); }}
               title="Snimi sliku"
@@ -1469,6 +2011,36 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                 ].filter(Boolean).length;
                 return activeCount === 0 ? 'PRAZAN' : activeCount === 15 ? 'KOMPLETAN' : `${activeCount}/15`;
               })()
+            } : m.type === 'deck' ? {
+              // Deck modul - teal boja
+              bg: 'linear-gradient(135deg, rgba(20,184,166,0.2) 0%, rgba(45,212,191,0.2) 100%)',
+              border: 'rgba(20,184,166,0.4)',
+              shadow: 'rgba(20,184,166,0.25)',
+              arrow: 'rgba(20,184,166,0.6)',
+              btnBg: 'rgba(20,184,166,0.2)',
+              btnBorder: 'rgba(20,184,166,0.3)',
+              btnHover: 'rgba(20,184,166,0.35)',
+              text: 'rgba(94,234,212,0.95)',
+              textSub: 'rgba(94,234,212,0.8)',
+              label: (() => {
+                const activeCount = [m.hasTerasaDeckOtkrivena, m.hasTerasaVelikaPergola].filter(Boolean).length;
+                return activeCount === 0 ? 'PRAZAN' : activeCount === 2 ? 'KOMPLETAN' : `${activeCount}/2`;
+              })()
+            } : m.type === 'smalldeck' ? {
+              // SmallDeck modul - cyan boja
+              bg: 'linear-gradient(135deg, rgba(6,182,212,0.2) 0%, rgba(34,211,238,0.2) 100%)',
+              border: 'rgba(6,182,212,0.4)',
+              shadow: 'rgba(6,182,212,0.25)',
+              arrow: 'rgba(6,182,212,0.6)',
+              btnBg: 'rgba(6,182,212,0.2)',
+              btnBorder: 'rgba(6,182,212,0.3)',
+              btnHover: 'rgba(6,182,212,0.35)',
+              text: 'rgba(103,232,249,0.95)',
+              textSub: 'rgba(103,232,249,0.8)',
+              label: (() => {
+                const activeCount = [m.hasTerasaDeckMala, m.hasMalaPergolaDesnagore, m.hasMalaPergolaLevaGore].filter(Boolean).length;
+                return activeCount === 0 ? 'PRAZAN' : activeCount === 3 ? 'KOMPLETAN' : `${activeCount}/3`;
+              })()
             } : {
               // Small modul - plava boja
               bg: 'linear-gradient(135deg, rgba(59,130,246,0.2) 0%, rgba(96,165,250,0.2) 100%)',
@@ -1536,10 +2108,12 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                   {/* Action buttons — top-right corner */}
                   <div style={{
                     position: 'absolute', top: 14, right: 14,
-                    display: 'flex', gap: 4, zIndex: 1,
+                    display: 'flex', flexDirection: 'column', gap: 4, zIndex: 1, alignItems: 'flex-end',
                   }}>
-                    {/* Rotate button - samo za large module */}
-                    {m.type === 'large' && (
+                    {/* Row 1: Rotate, Settings, X */}
+                    <div style={{ display: 'flex', gap: 4 }}>
+                    {/* Rotate button - za large, deck i smalldeck module */}
+                    {(m.type === 'large' || m.type === 'deck' || m.type === 'smalldeck') && (
                       <button
                         onMouseDown={e => e.stopPropagation()}
                         onClick={e => { e.stopPropagation(); rotateModule(m.id); }}
@@ -1588,6 +2162,27 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                       onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(239,68,68,0.5)')}
                       onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnBg)}
                     >✕</button>
+                    </div>
+                    {/* Row 2: Duplicate */}
+                    <button
+                      onMouseDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); duplicateModule(m.id); }}
+                      title="Dupliraj"
+                      style={{
+                        width: 22, height: 22, borderRadius: '50%',
+                        background: colors.btnBg,
+                        border: `1px solid ${colors.btnBorder}`, cursor: 'pointer', color: colors.text,
+                        fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        transition: 'background 0.15s', flexShrink: 0,
+                      }}
+                      onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnHover)}
+                      onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnBg)}
+                    >
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                      </svg>
+                    </button>
                   </div>
 
                   {/* Label — bottom-left */}
@@ -1597,7 +2192,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                         {colors.label}
                       </p>
                       <p style={{ fontSize: 10, opacity: 0.6, margin: '3px 0 0', whiteSpace: 'nowrap', color: colors.textSub }}>
-                        {m.rotation % 2 !== 0 ? '2.4 × 4.8 m' : '4.8 × 2.4 m'}
+                        {(m.type === 'small' || m.type === 'medium' || m.type === 'smalldeck') ? '2.4 × 2.4 m' : m.rotation % 2 !== 0 ? '2.4 × 4.8 m' : '4.8 × 2.4 m'}
                       </p>
                     </div>
                   )}
@@ -1642,7 +2237,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       </div>
       ) : (
       <div style={{ position: 'relative', height: 'calc(100vh - 56px)' }}>
-        <Scene3D modules={modules} cols={cols} rows={rows} />
+        <Scene3D modules={modules} cols={cols} rows={rows} lightSettings={lightSettings} sceneSettings={sceneSettings} />
         {modules.length === 0 && (
           <div style={{
             position: 'absolute', inset: 0,
@@ -1654,6 +2249,124 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
             </p>
           </div>
         )}
+        {/* ── Environment (scene) panel ────────────────────────── */}
+        <div style={{
+          position: 'absolute', bottom: 80, left: 24, zIndex: 10,
+          background: 'rgba(10,15,25,0.82)', backdropFilter: 'blur(12px)',
+          borderRadius: 14, padding: '16px 18px', width: 226,
+          border: '1px solid rgba(255,255,255,0.10)',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.55)',
+          color: '#fff',
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.09em', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 14 }}>
+            🌿&nbsp; Okruženje
+          </div>
+          {/* Teren */}
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Podloga</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {([
+                { key: 'trava',  label: '🌿 Trava',  color: '#4ade80' },
+                { key: 'suva',   label: '🌾 Suva',   color: '#d4a84b' },
+                { key: 'zemlja', label: '🪨 Zemlja', color: '#92614a' },
+                { key: 'pesak',  label: '🏖 Pesak',  color: '#e2c97e' },
+                { key: 'beton',  label: '🧱 Beton',  color: '#9ca3af' },
+              ] as { key: GrassType; label: string; color: string }[]).map(opt => (
+                <button key={opt.key}
+                  onClick={() => setSceneSettings(p => ({ ...p, grass: opt.key }))}
+                  style={{
+                    padding: '5px 10px', borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                    border: `1px solid ${sceneSettings.grass === opt.key ? opt.color : 'rgba(255,255,255,0.08)'}`,
+                    background: sceneSettings.grass === opt.key ? `${opt.color}22` : 'rgba(255,255,255,0.04)',
+                    color: sceneSettings.grass === opt.key ? opt.color : '#64748b',
+                  }}
+                >{opt.label}</button>
+              ))}
+            </div>
+          </div>
+          {/* Magla */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span style={{ fontSize: 11, color: '#94a3b8' }}>🌫 Magla / Izmaglica</span>
+            <button
+              onClick={() => setSceneSettings(p => ({ ...p, fogEnabled: !p.fogEnabled }))}
+              style={{
+                width: 40, height: 22, borderRadius: 11, border: 'none', cursor: 'pointer',
+                background: sceneSettings.fogEnabled ? '#3b82f6' : 'rgba(255,255,255,0.12)',
+                position: 'relative', transition: 'background 0.2s',
+              }}
+            >
+              <span style={{
+                position: 'absolute', top: 3, left: sceneSettings.fogEnabled ? 20 : 3,
+                width: 16, height: 16, borderRadius: '50%', background: '#fff',
+                transition: 'left 0.2s', display: 'block',
+              }} />
+            </button>
+          </div>
+        </div>
+        {/* ── Lighting control panel ───────────────────────────── */}
+        <div style={{
+          position: 'absolute', bottom: 60, right: 24, zIndex: 10,
+          background: 'rgba(10,15,25,0.82)', backdropFilter: 'blur(12px)',
+          borderRadius: 14, padding: '16px 18px', width: 248,
+          border: '1px solid rgba(255,255,255,0.10)',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.55)',
+          color: '#fff',
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.09em', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 14 }}>
+            {lightSettings.isDay ? '☀️' : '🌙'}&nbsp; Svetlost
+          </div>
+          {/* Dan / Noć */}
+          <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+            <button
+              onClick={() => setLightSettings(p => ({ ...p, isDay: true }))}
+              style={{
+                flex: 1, padding: '7px 0', borderRadius: 8, fontSize: 12, fontWeight: 600,
+                border: `1px solid ${lightSettings.isDay ? '#f59e0b' : 'rgba(255,255,255,0.08)'}`,
+                cursor: 'pointer',
+                background: lightSettings.isDay ? '#f59e0b' : 'rgba(255,255,255,0.05)',
+                color: lightSettings.isDay ? '#000' : '#64748b',
+              }}
+            >☀️ Dan</button>
+            <button
+              onClick={() => setLightSettings(p => ({ ...p, isDay: false }))}
+              style={{
+                flex: 1, padding: '7px 0', borderRadius: 8, fontSize: 12, fontWeight: 600,
+                border: `1px solid ${!lightSettings.isDay ? '#3b82f6' : 'rgba(255,255,255,0.08)'}`,
+                cursor: 'pointer',
+                background: !lightSettings.isDay ? '#3b82f6' : 'rgba(255,255,255,0.05)',
+                color: !lightSettings.isDay ? '#fff' : '#64748b',
+              }}
+            >🌙 Noć</button>
+          </div>
+          {/* Pravac sunca */}
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>Pravac {lightSettings.isDay ? 'sunca' : 'meseca'}</span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b' }}>{sunDirectionLabel(lightSettings.sunAngle)}</span>
+            </div>
+            <input type="range" min={0} max={359} step={1} value={lightSettings.sunAngle}
+              onChange={e => setLightSettings(p => ({ ...p, sunAngle: +e.target.value }))}
+              style={{ width: '100%', cursor: 'pointer', accentColor: '#f59e0b' }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475569', marginTop: 3 }}>
+              <span>S</span><span>I</span><span>J</span><span>Z</span><span>S</span>
+            </div>
+          </div>
+          {/* Visina sunca */}
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>Visina</span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b' }}>{lightSettings.sunElevation}°</span>
+            </div>
+            <input type="range" min={5} max={85} step={1} value={lightSettings.sunElevation}
+              onChange={e => setLightSettings(p => ({ ...p, sunElevation: +e.target.value }))}
+              style={{ width: '100%', cursor: 'pointer', accentColor: '#f59e0b' }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475569', marginTop: 3 }}>
+              <span>Nizak</span><span>Visok</span>
+            </div>
+          </div>
+        </div>
       </div>
       )}
 
@@ -1669,13 +2382,19 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
           editingModule.hasFasada1PodiznoKlizna, editingModule.hasFasada1Fix,
           editingModule.hasFasada2PodiznoKlizna, editingModule.hasFasada2Fix,
           editingModule.hasFasada3PodiznoKlizna, editingModule.hasFasada3Fix, editingModule.hasFasada1PunZid,
+        ].filter(Boolean).length : editingModule.type === 'deck' ? [
+          editingModule.hasTerasaDeckOtkrivena, editingModule.hasTerasaVelikaPergola,
+        ].filter(Boolean).length : editingModule.type === 'smalldeck' ? [
+          editingModule.hasTerasaDeckMala, editingModule.hasMalaPergolaDesnagore, editingModule.hasMalaPergolaLevaGore,
         ].filter(Boolean).length : [
           editingModule.hasKonstrukcija, editingModule.hasStakleniKrov, editingModule.hasFasada2PunZid, 
           editingModule.hasFasada1SaVratima, editingModule.hasFasada1BezVrata, editingModule.hasFasada4PodiznoKlizna, 
           editingModule.hasFasada4Fix, editingModule.hasFasada4KupatiloProzor, editingModule.hasFasada3ProzorSpavaca, 
           editingModule.hasFasada3PunZid, editingModule.hasKrovPun, editingModule.hasFasada4PunZid,
+          editingModule.hasFasada1SaVratimaR, editingModule.hasFasada1BezVrataR, editingModule.hasFasada1PunZidR,
+          editingModule.hasFasada3ProzorSpavacaR, editingModule.hasFasada3PunZidR,
         ].filter(Boolean).length;
-        const maxCount = editingModule.type === 'large' ? 12 : (editingModule.type === 'medium' || editingModule.type === 'small') ? 15 : 0;
+        const maxCount = editingModule.type === 'large' ? 17 : (editingModule.type === 'medium' || editingModule.type === 'small') ? 15 : editingModule.type === 'deck' ? 2 : editingModule.type === 'smalldeck' ? 3 : 0;
         
         return (
           <div
@@ -1691,15 +2410,43 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               background: 'linear-gradient(135deg, rgba(17,17,24,0.98) 0%, rgba(24,24,36,0.98) 100%)',
               border: '1px solid rgba(255,255,255,0.08)',
               borderRadius: 20, 
-              width: '92vw', 
-              maxWidth: 520,
+              width: '98vw', 
+              maxWidth: 1400,
               maxHeight: '90vh',
               display: 'flex', 
-              flexDirection: 'column',
+              flexDirection: 'row',
               fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif',
               boxShadow: '0 20px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.03)',
               overflow: 'hidden',
             }}>
+              {/* LEFT — 3D preview */}
+              <div style={{
+                flex: 1,
+                minWidth: 900,
+                flexShrink: 1,
+                background: 'rgba(0,0,0,0.35)',
+                borderRight: '1px solid rgba(255,255,255,0.06)',
+                borderRadius: '20px 0 0 20px',
+                overflow: 'hidden',
+                position: 'relative',
+              }}>
+                <div
+                  ref={previewMountRef}
+                  style={{ width: '100%', height: '100%', minHeight: 400 }}
+                />
+                {/* Watermark label */}
+                <div style={{
+                  position: 'absolute', bottom: 14, left: 0, right: 0,
+                  textAlign: 'center',
+                  fontSize: 11, fontWeight: 600, color: 'rgba(255,255,255,0.25)',
+                  letterSpacing: 0.5, pointerEvents: 'none',
+                }}>
+                  3D PRIKAZ
+                </div>
+              </div>
+
+              {/* RIGHT — header + scrollable options */}
+              <div style={{ width: 480, flexShrink: 0, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
               {/* Header */}
               <div style={{ 
                 padding: '24px 28px 20px', 
@@ -1781,6 +2528,185 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               className="custom-scrollbar"
               >
                 
+                {/* ── DECK TIP — posebne opcije ── */}
+                {editingModule.type === 'deck' && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.5, marginBottom: 12, textTransform: 'uppercase' }}>TERASA</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      <button
+                        onClick={() => toggleTerasaDeckOtkrivena(editingModuleId)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 14,
+                          background: editingModule.hasTerasaDeckOtkrivena
+                            ? 'linear-gradient(135deg, rgba(20,184,166,0.15) 0%, rgba(20,184,166,0.08) 100%)'
+                            : 'rgba(255,255,255,0.03)',
+                          border: editingModule.hasTerasaDeckOtkrivena ? '2px solid rgba(20,184,166,0.5)' : '2px solid rgba(255,255,255,0.08)',
+                          borderRadius: 14, padding: '14px 16px',
+                          cursor: 'pointer', textAlign: 'left',
+                          transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule.hasTerasaDeckOtkrivena
+                            ? '0 0 24px rgba(20,184,166,0.15), 0 4px 12px rgba(0,0,0,0.15)'
+                            : '0 2px 8px rgba(0,0,0,0.08)',
+                        }}
+                        onMouseEnter={e => {
+                          (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasTerasaDeckOtkrivena ? 'linear-gradient(135deg, rgba(20,184,166,0.2) 0%, rgba(20,184,166,0.12) 100%)' : 'rgba(255,255,255,0.06)';
+                          (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.01) translateY(-1px)';
+                        }}
+                        onMouseLeave={e => {
+                          (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasTerasaDeckOtkrivena ? 'linear-gradient(135deg, rgba(20,184,166,0.15) 0%, rgba(20,184,166,0.08) 100%)' : 'rgba(255,255,255,0.03)';
+                          (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        }}
+                      >
+                        <div style={{
+                          width: 44, height: 24, borderRadius: 12,
+                          background: editingModule.hasTerasaDeckOtkrivena
+                            ? 'linear-gradient(135deg, rgba(20,184,166,0.95) 0%, rgba(13,148,136,0.95) 100%)'
+                            : 'rgba(255,255,255,0.08)',
+                          position: 'relative', flexShrink: 0,
+                          transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule.hasTerasaDeckOtkrivena ? '0 2px 8px rgba(20,184,166,0.3)' : 'none',
+                        }}>
+                          <div style={{
+                            width: 18, height: 18, borderRadius: '50%', background: '#fff',
+                            position: 'absolute', top: 3,
+                            left: editingModule.hasTerasaDeckOtkrivena ? 23 : 3,
+                            transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                            boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+                          }} />
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.95)', marginBottom: 2 }}>Deck otkrivena</div>
+                          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>Otvorena terasa bez pergole</div>
+                        </div>
+                        {editingModule.hasTerasaDeckOtkrivena && (
+                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(20,184,166,0.95)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12"/>
+                          </svg>
+                        )}
+                      </button>
+
+                      <button
+                        onClick={() => toggleTerasaVelikaPergola(editingModuleId)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 14,
+                          background: editingModule.hasTerasaVelikaPergola
+                            ? 'linear-gradient(135deg, rgba(45,212,191,0.15) 0%, rgba(45,212,191,0.08) 100%)'
+                            : 'rgba(255,255,255,0.03)',
+                          border: editingModule.hasTerasaVelikaPergola ? '2px solid rgba(45,212,191,0.5)' : '2px solid rgba(255,255,255,0.08)',
+                          borderRadius: 14, padding: '14px 16px',
+                          cursor: 'pointer', textAlign: 'left',
+                          transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule.hasTerasaVelikaPergola
+                            ? '0 0 24px rgba(45,212,191,0.15), 0 4px 12px rgba(0,0,0,0.15)'
+                            : '0 2px 8px rgba(0,0,0,0.08)',
+                        }}
+                        onMouseEnter={e => {
+                          (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasTerasaVelikaPergola ? 'linear-gradient(135deg, rgba(45,212,191,0.2) 0%, rgba(45,212,191,0.12) 100%)' : 'rgba(255,255,255,0.06)';
+                          (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.01) translateY(-1px)';
+                        }}
+                        onMouseLeave={e => {
+                          (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasTerasaVelikaPergola ? 'linear-gradient(135deg, rgba(45,212,191,0.15) 0%, rgba(45,212,191,0.08) 100%)' : 'rgba(255,255,255,0.03)';
+                          (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        }}
+                      >
+                        <div style={{
+                          width: 44, height: 24, borderRadius: 12,
+                          background: editingModule.hasTerasaVelikaPergola
+                            ? 'linear-gradient(135deg, rgba(45,212,191,0.95) 0%, rgba(20,184,166,0.95) 100%)'
+                            : 'rgba(255,255,255,0.08)',
+                          position: 'relative', flexShrink: 0,
+                          transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule.hasTerasaVelikaPergola ? '0 2px 8px rgba(45,212,191,0.3)' : 'none',
+                        }}>
+                          <div style={{
+                            width: 18, height: 18, borderRadius: '50%', background: '#fff',
+                            position: 'absolute', top: 3,
+                            left: editingModule.hasTerasaVelikaPergola ? 23 : 3,
+                            transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                            boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+                          }} />
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.95)', marginBottom: 2 }}>Velika pergola</div>
+                          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>Terasa sa velikom pergolom</div>
+                        </div>
+                        {editingModule.hasTerasaVelikaPergola && (
+                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(45,212,191,0.95)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12"/>
+                          </svg>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* ── SMALLDECK TIP — posebne opcije ── */}
+                {editingModule.type === 'smalldeck' && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.5, marginBottom: 12, textTransform: 'uppercase' }}>MALA TERASA</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      {[
+                        { key: 'hasTerasaDeckMala' as const, label: 'Deck mala', sub: 'Mala otvorena terasa', toggle: toggleTerasaDeckMala, color: '6,182,212' },
+                        { key: 'hasMalaPergolaDesnagore' as const, label: 'Mala pergola desna', sub: 'Desna pergola gore', toggle: toggleMalaPergolaDesnagore, color: '34,211,238' },
+                        { key: 'hasMalaPergolaLevaGore' as const, label: 'Mala pergola leva', sub: 'Leva pergola gore', toggle: toggleMalaPergolaLevaGore, color: '6,182,212' },
+                      ].map(({ key, label, sub, toggle, color }) => (
+                        <button
+                          key={key}
+                          onClick={() => toggle(editingModuleId)}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 14,
+                            background: editingModule[key]
+                              ? `linear-gradient(135deg, rgba(${color},0.15) 0%, rgba(${color},0.08) 100%)`
+                              : 'rgba(255,255,255,0.03)',
+                            border: editingModule[key] ? `2px solid rgba(${color},0.5)` : '2px solid rgba(255,255,255,0.08)',
+                            borderRadius: 14, padding: '14px 16px',
+                            cursor: 'pointer', textAlign: 'left',
+                            transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                            boxShadow: editingModule[key]
+                              ? `0 0 24px rgba(${color},0.15), 0 4px 12px rgba(0,0,0,0.15)`
+                              : '0 2px 8px rgba(0,0,0,0.08)',
+                          }}
+                          onMouseEnter={e => {
+                            (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.01) translateY(-1px)';
+                          }}
+                          onMouseLeave={e => {
+                            (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                          }}
+                        >
+                          <div style={{
+                            width: 44, height: 24, borderRadius: 12,
+                            background: editingModule[key]
+                              ? `linear-gradient(135deg, rgba(${color},0.95) 0%, rgba(${color},0.8) 100%)`
+                              : 'rgba(255,255,255,0.08)',
+                            position: 'relative', flexShrink: 0,
+                            transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                            boxShadow: editingModule[key] ? `0 2px 8px rgba(${color},0.3)` : 'none',
+                          }}>
+                            <div style={{
+                              width: 18, height: 18, borderRadius: '50%', background: '#fff',
+                              position: 'absolute', top: 3,
+                              left: editingModule[key] ? 23 : 3,
+                              transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                              boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+                            }} />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.95)', marginBottom: 2 }}>{label}</div>
+                            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>{sub}</div>
+                          </div>
+                          {editingModule[key] && (
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={`rgba(${color},0.95)`} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="20 6 9 17 4 12"/>
+                            </svg>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Ostale opcije samo za ne-deck i ne-smalldeck tipove */}
+                {editingModule.type !== 'deck' && editingModule.type !== 'smalldeck' && (<>
                 {/* KONSTRUKCIJA */}
                 <div>
                   <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.5, marginBottom: 12, textTransform: 'uppercase' }}>KONSTRUKCIJA</div>
@@ -1990,7 +2916,97 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                 <div>
                   <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.5, marginBottom: 12, textTransform: 'uppercase' }}>FASADE</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-                    <button
+                    {/* ── LARGE: fasade 1→4 u redosledu ── */}
+                    {editingModule.type === 'large' && [
+                      { key: 'hasFasada1SaVratima' as const,     label: 'Fasada 1 - Sa vratima',     toggle: toggleFasada1SaVratima,     color: '168,85,247',  color2: '147,2,234'   },
+                      { key: 'hasFasada1BezVrata' as const,      label: 'Fasada 1 - Bez vrata',      toggle: toggleFasada1BezVrata,      color: '236,72,153',  color2: '219,39,119'  },
+                      { key: 'hasFasada2PunZid' as const,        label: 'Fasada 2 - Puni zid',       toggle: toggleFasada2PunZid,        color: '34,197,94',   color2: '22,163,74'   },
+                      { key: 'hasFasada3ProzorSpavaca' as const, label: 'Fasada 3 - Spavaća soba',   toggle: toggleFasada3ProzorSpavaca, color: '244,63,94',   color2: '225,29,72'   },
+                      { key: 'hasFasada3PunZid' as const,        label: 'Fasada 3 - Puni zid',       toggle: toggleFasada3PunZid,        color: '132,204,22',  color2: '101,163,13'  },
+                      { key: 'hasFasada4PodiznoKlizna' as const, label: 'Fasada 4 - Podizno klizna', toggle: toggleFasada4PodiznoKlizna, color: '245,158,11',  color2: '217,119,6'   },
+                      { key: 'hasFasada4Fix' as const,           label: 'Fasada 4 - Fiksna',         toggle: toggleFasada4Fix,           color: '99,102,241',  color2: '79,70,229'   },
+                      { key: 'hasFasada4KupatiloProzor' as const,label: 'Fasada 4 - Kupatilo',       toggle: toggleFasada4KupatiloProzor,color: '6,182,212',   color2: '8,145,178'   },
+                      { key: 'hasFasada4PunZid' as const,        label: 'Fasada 4 - Puni zid',       toggle: toggleFasada4PunZid,        color: '147,51,234',  color2: '126,34,206'  },
+                    ].map(({ key, label, toggle, color, color2 }) => (
+                      <button key={key}
+                        onClick={() => toggle(editingModuleId)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 12,
+                          background: editingModule[key] ? `linear-gradient(135deg, rgba(${color},0.14) 0%, rgba(${color},0.07) 100%)` : 'rgba(255,255,255,0.03)',
+                          border: editingModule[key] ? `2px solid rgba(${color},0.48)` : '2px solid rgba(255,255,255,0.08)',
+                          borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left',
+                          transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule[key] ? `0 0 20px rgba(${color},0.12), 0 3px 10px rgba(0,0,0,0.12)` : '0 2px 6px rgba(0,0,0,0.06)',
+                        }}
+                        onMouseEnter={e => {
+                          (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                          (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule[key] ? `0 0 28px rgba(${color},0.2), 0 5px 14px rgba(0,0,0,0.16)` : '0 3px 10px rgba(0,0,0,0.10)';
+                        }}
+                        onMouseLeave={e => {
+                          (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                          (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule[key] ? `0 0 20px rgba(${color},0.12), 0 3px 10px rgba(0,0,0,0.12)` : '0 2px 6px rgba(0,0,0,0.06)';
+                        }}
+                      >
+                        <div style={{
+                          width: 40, height: 22, borderRadius: 11,
+                          background: editingModule[key] ? `linear-gradient(135deg, rgba(${color},0.92) 0%, rgba(${color2},0.92) 100%)` : 'rgba(255,255,255,0.08)',
+                          position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule[key] ? `0 2px 6px rgba(${color},0.25)` : 'none',
+                        }}>
+                          <div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff',
+                            position: 'absolute', top: 3, left: editingModule[key] ? 21 : 3,
+                            transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                          }} />
+                        </div>
+                        <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>{label}</div>
+                        {editingModule[key] && (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={`rgba(${color},0.92)`} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: `drop-shadow(0 0 3px rgba(${color},0.35))` }}>
+                            <polyline points="20 6 9 17 4 12"/>
+                          </svg>
+                        )}
+                      </button>
+                    ))}
+                    {/* ── MEDIUM/SMALL: fasade 1→4 u redosledu ── */}
+                    {(editingModule.type === 'medium' || editingModule.type === 'small') && [
+                      { key: 'hasFasada1PunZid' as const,        label: 'Fasada 1 - Puni zid',       toggle: toggleFasada1PunZid,        color: '249,115,22',  color2: '234,88,12'   },
+                      { key: 'hasFasada1PodiznoKlizna' as const, label: 'Fasada 1 - Podizno klizna', toggle: toggleFasada1PodiznoKlizna, color: '20,184,166',  color2: '13,148,136'  },
+                      { key: 'hasFasada1Fix' as const,           label: 'Fasada 1 - Fiksna',         toggle: toggleFasada1Fix,           color: '14,165,233',  color2: '2,132,199'   },
+                      { key: 'hasFasada2PodiznoKlizna' as const, label: 'Fasada 2 - Podizno klizna', toggle: toggleFasada2PodiznoKlizna, color: '217,70,239',  color2: '192,38,211'  },
+                      { key: 'hasFasada2Fix' as const,           label: 'Fasada 2 - Fiksna',         toggle: toggleFasada2Fix,           color: '16,185,129',  color2: '5,150,105'   },
+                      { key: 'hasFasada2PunZid' as const,        label: 'Fasada 2 - Puni zid',       toggle: toggleFasada2PunZid,        color: '34,197,94',   color2: '22,163,74'   },
+                      { key: 'hasFasada3PodiznoKlizna' as const, label: 'Fasada 3 - Podizno klizna', toggle: toggleFasada3PodiznoKlizna, color: '234,179,8',   color2: '202,138,4'   },
+                      { key: 'hasFasada3Fix' as const,           label: 'Fasada 3 - Fiksna',         toggle: toggleFasada3Fix,           color: '239,68,68',   color2: '220,38,38'   },
+                      { key: 'hasFasada3PunZid' as const,        label: 'Fasada 3 - Puni zid',       toggle: toggleFasada3PunZid,        color: '132,204,22',  color2: '101,163,13'  },
+                      { key: 'hasFasada4PodiznoKlizna' as const, label: 'Fasada 4 - Podizno klizna', toggle: toggleFasada4PodiznoKlizna, color: '245,158,11',  color2: '217,119,6'   },
+                      { key: 'hasFasada4Fix' as const,           label: 'Fasada 4 - Fiksna',         toggle: toggleFasada4Fix,           color: '99,102,241',  color2: '79,70,229'   },
+                      { key: 'hasFasada4PunZid' as const,        label: 'Fasada 4 - Puni zid',       toggle: toggleFasada4PunZid,        color: '147,51,234',  color2: '126,34,206'  },
+                    ].map(({ key, label, toggle, color, color2 }) => (
+                      <button key={key} onClick={() => toggle(editingModuleId)}
+                        style={{ display: 'flex', alignItems: 'center', gap: 12,
+                          background: editingModule[key] ? `linear-gradient(135deg, rgba(${color},0.14) 0%, rgba(${color},0.07) 100%)` : 'rgba(255,255,255,0.03)',
+                          border: editingModule[key] ? `2px solid rgba(${color},0.48)` : '2px solid rgba(255,255,255,0.08)',
+                          borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left',
+                          transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule[key] ? `0 0 20px rgba(${color},0.12), 0 3px 10px rgba(0,0,0,0.12)` : '0 2px 6px rgba(0,0,0,0.06)',
+                        }}
+                        onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)'; }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)'; }}
+                      >
+                        <div style={{ width: 40, height: 22, borderRadius: 11,
+                          background: editingModule[key] ? `linear-gradient(135deg, rgba(${color},0.92) 0%, rgba(${color2},0.92) 100%)` : 'rgba(255,255,255,0.08)',
+                          position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: editingModule[key] ? `0 2px 6px rgba(${color},0.25)` : 'none',
+                        }}>
+                          <div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff',
+                            position: 'absolute', top: 3, left: editingModule[key] ? 21 : 3,
+                            transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                          }} />
+                        </div>
+                        <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>{label}</div>
+                        {editingModule[key] && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={`rgba(${color},0.92)`} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: `drop-shadow(0 0 3px rgba(${color},0.35))` }}><polyline points="20 6 9 17 4 12"/></svg>)}
+                      </button>
+                    ))}
+                    {/*<button
                       onClick={() => toggleFasada2PunZid(editingModuleId)}
                       style={{
                         display: 'flex', alignItems: 'center', gap: 12,
@@ -2595,13 +3611,123 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                       {editingModule.hasFasada3Fix && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(239,68,68,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
                     </button>
                     </>)}
+                    */}
+
+                    {/* _R grupe — samo za large_full_modul.glb */}
+                    {editingModule.type === 'large' && (<>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.3)', letterSpacing: 0.5, margin: '6px 0 10px', textTransform: 'uppercase' }}>DESNA STRANA (_R)</div>
+                    {[
+                      { key: 'hasFasada1SaVratimaR' as const,    label: 'Fasada 1D - Sa vratima',     toggle: toggleFasada1SaVratimaR,    color: '168,85,247' },
+                      { key: 'hasFasada1BezVrataR' as const,     label: 'Fasada 1D - Bez vrata',      toggle: toggleFasada1BezVrataR,     color: '236,72,153' },
+                      { key: 'hasFasada1PunZidR' as const,       label: 'Fasada 1D - Puni zid',       toggle: toggleFasada1PunZidR,       color: '249,115,22' },
+                      { key: 'hasFasada3ProzorSpavacaR' as const, label: 'Fasada 3D - Prozor spavaća', toggle: toggleFasada3ProzorSpavacaR, color: '59,130,246' },
+                      { key: 'hasFasada3PunZidR' as const,       label: 'Fasada 3D - Puni zid',       toggle: toggleFasada3PunZidR,       color: '132,204,22' },
+                    ].map(({ key, label, toggle, color }) => (
+                      <button key={key} onClick={() => toggle(editingModuleId)}
+                        style={{ display: 'flex', alignItems: 'center', gap: 12,
+                          background: editingModule[key] ? `linear-gradient(135deg,rgba(${color},0.14) 0%,rgba(${color},0.07) 100%)` : 'rgba(255,255,255,0.03)',
+                          border: editingModule[key] ? `2px solid rgba(${color},0.48)` : '2px solid rgba(255,255,255,0.08)',
+                          borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left',
+                          transition: 'all 0.4s cubic-bezier(0.4,0,0.2,1)',
+                          boxShadow: editingModule[key] ? `0 0 20px rgba(${color},0.12),0 3px 10px rgba(0,0,0,0.12)` : '0 2px 6px rgba(0,0,0,0.06)',
+                        }}
+                        onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)'; }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)'; }}
+                      >
+                        <div style={{ width: 40, height: 22, borderRadius: 11,
+                          background: editingModule[key] ? `linear-gradient(135deg,rgba(${color},0.92) 0%,rgba(${color},0.75) 100%)` : 'rgba(255,255,255,0.08)',
+                          position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4,0,0.2,1)',
+                          boxShadow: editingModule[key] ? `0 2px 6px rgba(${color},0.25)` : 'none',
+                        }}>
+                          <div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff',
+                            position: 'absolute', top: 3, left: editingModule[key] ? 21 : 3,
+                            transition: 'left 0.4s cubic-bezier(0.4,0,0.2,1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                          }} />
+                        </div>
+                        <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>{label}</div>
+                        {editingModule[key] && (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={`rgba(${color},0.92)`} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                        )}
+                      </button>
+                    ))}
+                    </>)}
                   </div>
                 </div>
+                </>)}{/* end non-deck content */}
               </div>
             </div>
+            </div>{/* end RIGHT column */}
           </div>
         );
       })()}
+
+      {/* ── Objekti Modal ── */}
+      {objektiModalOpen && (
+        <div
+          onClick={() => setObjektiModalOpen(false)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1000,
+            background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: '#141418', border: '1px solid rgba(255,255,255,0.08)',
+              borderRadius: 20, width: 560, maxWidth: '95vw', maxHeight: '80vh',
+              display: 'flex', flexDirection: 'column', overflow: 'hidden',
+              boxShadow: '0 24px 64px rgba(0,0,0,0.7)',
+            }}
+          >
+            {/* Header */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px 14px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: '#fff' }}>Objekti</div>
+                <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)', marginTop: 2 }}>Dodaj 3D objekte u scenu</div>
+              </div>
+              <button
+                onClick={() => setObjektiModalOpen(false)}
+                style={{ width: 28, height: 28, borderRadius: '50%', background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer', color: 'rgba(255,255,255,0.6)', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              >✕</button>
+            </div>
+            {/* Content */}
+            <div style={{ padding: '16px 24px 24px', overflowY: 'auto' }} className="custom-scrollbar">
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.08em', textTransform: 'uppercase', fontWeight: 600, marginBottom: 12 }}>Dostupni objekti</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
+                {[
+                  { name: 'Lampa', icon: '💡', desc: 'Spoljna lampa', soon: true },
+                  { name: 'Cveće', icon: '🌿', desc: 'Ukrasno bilje', soon: true },
+                  { name: 'Klupa', icon: '🪑', desc: 'Drvena klupa', soon: true },
+                  { name: 'Drvo', icon: '🌳', desc: 'Listopadno drvo', soon: true },
+                  { name: 'Auto', icon: '🚗', desc: 'Parkirano vozilo', soon: true },
+                  { name: 'Ograda', icon: '🏗️', desc: 'Drvena ograda', soon: true },
+                ].map(obj => (
+                  <div
+                    key={obj.name}
+                    style={{
+                      background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+                      borderRadius: 12, padding: '14px 12px', cursor: obj.soon ? 'default' : 'pointer',
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
+                      opacity: obj.soon ? 0.5 : 1, position: 'relative',
+                      transition: 'background 0.15s, border-color 0.15s',
+                    }}
+                    onMouseEnter={e => { if (!obj.soon) { (e.currentTarget as HTMLDivElement).style.background = 'rgba(99,102,241,0.12)'; (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(99,102,241,0.4)'; } }}
+                    onMouseLeave={e => { if (!obj.soon) { (e.currentTarget as HTMLDivElement).style.background = 'rgba(255,255,255,0.03)'; (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(255,255,255,0.07)'; } }}
+                  >
+                    <span style={{ fontSize: 28 }}>{obj.icon}</span>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.85)' }}>{obj.name}</span>
+                    <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)', textAlign: 'center' }}>{obj.desc}</span>
+                    {obj.soon && (
+                      <span style={{ position: 'absolute', top: 8, right: 8, fontSize: 9, fontWeight: 700, color: 'rgba(255,200,50,0.8)', background: 'rgba(255,200,50,0.1)', border: '1px solid rgba(255,200,50,0.2)', borderRadius: 4, padding: '1px 5px', letterSpacing: '0.05em' }}>USKORO</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <style>{`
         @keyframes spin { 
