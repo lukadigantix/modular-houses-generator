@@ -1,0 +1,2636 @@
+'use client';
+
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { supabase } from '@/lib/supabase';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
+// ---------------------------------------------------------------------------
+// Constants — 1 cell = 2.4 m in real life
+// ---------------------------------------------------------------------------
+const CELL         = 120;  // px (logical, before zoom)
+const DEFAULT_COLS = 20;
+const DEFAULT_ROWS = 14;
+const GRID_MARGIN  = 3;   // cells of buffer before auto-expand triggers
+const GRID_EXPAND  = 4;   // cells added per expansion
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 2.5;
+const ZOOM_STEP = 0.15;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+type ModuleType = 'large' | 'small' | 'medium';
+
+interface PlacedModule {
+  id:      string;
+  type:    ModuleType;
+  glbFile: string; // 'large_full_final.glb' or 'small_full.glb'
+  // Kontrole za grupe unutar large_full_final.glb (12 grupa):
+  hasKonstrukcija: boolean;
+  hasStakleniKrov: boolean;
+  hasFasada2PunZid: boolean;
+  hasFasada1SaVratima: boolean;
+  hasFasada1BezVrata: boolean;
+  hasFasada4PodiznoKlizna: boolean;
+  hasFasada4Fix: boolean;
+  hasFasada4KupatiloProzor: boolean;
+  hasFasada3ProzorSpavaca: boolean;
+  hasFasada3PunZid: boolean;
+  hasKrovPun: boolean;
+  hasFasada4PunZid: boolean;
+  // Polja za medium tip (small_v2_full.glb):
+  hasFasada1PodiznoKlizna: boolean;
+  hasFasada1Fix: boolean;
+  hasFasada2PodiznoKlizna: boolean;
+  hasFasada2Fix: boolean;
+  hasFasada3PodiznoKlizna: boolean;
+  hasFasada3Fix: boolean;
+  hasFasada1PunZid: boolean;
+  col:     number;
+  row:     number;
+  /** 0=eave-left 1=eave-top 2=eave-right 3=eave-bottom (all large only) */
+  rotation: 0 | 1 | 2 | 3;
+}
+
+interface DragState {
+  id:        string;
+  /** Click offset (px) from the module's top-left corner inside the grid */
+  offsetX:   number;
+  offsetY:   number;
+  /** Current snapped ghost position */
+  ghostCol:  number;
+  ghostRow:  number;
+}
+
+// ---------------------------------------------------------------------------
+// Grid helpers
+// ---------------------------------------------------------------------------
+function moduleSize(m: PlacedModule): { w: number; h: number } {
+  // Small modul je uvek 1x1
+  if (m.type === 'small' || m.type === 'medium') {
+    return { w: 1, h: 1 };
+  }
+  // Large modul ima rotation-dependent footprint
+  return m.rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 };
+}
+
+function overlaps(a: PlacedModule, b: PlacedModule): boolean {
+  const as = moduleSize(a);
+  const bs = moduleSize(b);
+  return (
+    a.col < b.col + bs.w &&
+    a.col + as.w > b.col &&
+    a.row < b.row + bs.h &&
+    a.row + as.h > b.row
+  );
+}
+
+function inBounds(m: PlacedModule, cols: number, rows: number): boolean {
+  const { w, h } = moduleSize(m);
+  return m.col >= 0 && m.row >= 0 && m.col + w <= cols && m.row + h <= rows;
+}
+
+function firstFreePosition(
+  type:     ModuleType,
+  rotation: 0 | 1 | 2 | 3,
+  placed:   PlacedModule[],
+  cols:     number,
+  rows:     number,
+): { col: number; row: number } | null {
+  const dummy = { id: '__test__', type, col: 0, row: 0, rotation } as PlacedModule;
+  // Step by 0.5 so auto-placement also respects the half-cell grid
+  for (let row = 0; row < rows; row += 0.5) {
+    for (let col = 0; col < cols; col += 0.5) {
+      const candidate = { ...dummy, col, row };
+      if (inBounds(candidate, cols, rows) && !placed.some(m => overlaps(candidate, m))) {
+        return { col, row };
+      }
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Generator — simplified for custom modules only
+// ---------------------------------------------------------------------------
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function generateLayout(smallCount: number, largeCount: number, tallCount: number, cols = DEFAULT_COLS, rows = DEFAULT_ROWS): PlacedModule[] {
+  // GLB mode doesn't use auto-generation - return empty array
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Scene3D — Three.js 3D preview
+// ---------------------------------------------------------------------------
+function Scene3D({ modules, cols, rows }: { modules: PlacedModule[]; cols: number; rows: number }) {
+  const mountRef = useRef<HTMLDivElement>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+
+  useEffect(() => {
+    const mount = mountRef.current!;
+    // Read dimensions after mount; fall back to window size if the element
+    // hasn't been laid-out yet (clientWidth/Height === 0).
+    const w = mount.clientWidth  || window.innerWidth;
+    const h = mount.clientHeight || (window.innerHeight - 56);
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    rendererRef.current = renderer;
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(w, h);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearColor(0x1b3458);
+    mount.appendChild(renderer.domElement);
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1b3458);
+    scene.fog = new THREE.FogExp2(0x1b3458, 0.006);
+
+    // Compute center from placed modules (or fall back to grid centre)
+    let centerX: number, centerZ: number;
+    if (modules.length === 0) {
+      centerX = (cols / 2) * 2.4;
+      centerZ = (rows / 2) * 2.4;
+    } else {
+      let minC = Infinity, minR = Infinity, maxC = -Infinity, maxR = -Infinity;
+      for (const m of modules) {
+        const { w: mw2, h: mh2 } = moduleSize(m);
+        if (m.col < minC) minC = m.col;
+        if (m.row < minR) minR = m.row;
+        if (m.col + mw2 > maxC) maxC = m.col + mw2;
+        if (m.row + mh2 > maxR) maxR = m.row + mh2;
+      }
+      centerX = (minC + maxC) / 2 * 2.4;
+      centerZ = (minR + maxR) / 2 * 2.4;
+    }
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(50, w / h, 0.1, 1000);
+    camera.position.set(centerX, 22, centerZ + 28);
+    camera.lookAt(centerX, 0, centerZ);
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0x3464a0, 0x1a1a28, 0.7);
+    scene.add(hemi);
+
+    const dirLight = new THREE.DirectionalLight(0xfff5e8, 2.0);
+    dirLight.position.set(centerX + 20, 35, centerZ - 10);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.width  = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    dirLight.shadow.camera.near   = 0.5;
+    dirLight.shadow.camera.far    = 200;
+    dirLight.shadow.camera.left   = -60;
+    dirLight.shadow.camera.right  =  60;
+    dirLight.shadow.camera.top    =  60;
+    dirLight.shadow.camera.bottom = -60;
+    scene.add(dirLight);
+
+    const fillLight = new THREE.DirectionalLight(0x6a90c0, 0.9);
+    fillLight.position.set(centerX - 20, 18, centerZ + 20);
+    scene.add(fillLight);
+
+    // Floor
+    const floorGeo = new THREE.PlaneGeometry(cols * 2.4 + 60, rows * 2.4 + 60);
+    const floorMat = new THREE.MeshStandardMaterial({ color: 0x232330, roughness: 0.88, metalness: 0.05 });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(centerX, 0, centerZ);
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // Grid lines
+    const gridHelper = new THREE.GridHelper(
+      Math.max(cols, rows) * 2.4 + 10,
+      Math.max(cols, rows) + 4,
+      0x2d2d3c,
+      0x272732,
+    );
+    gridHelper.position.set(centerX, 0.01, centerZ);
+    scene.add(gridHelper);
+
+    // Modules — rendered as GLB models only
+
+    // Custom GLB modules — loaded async via GLTFLoader
+    const customMeshes: THREE.Object3D[] = [];
+    if (modules.length > 0) {
+      const loader = new GLTFLoader();
+      modules.forEach(m => {
+        // ═══════════════════════════════════════════════════════════════
+        // UVEK UČITAVA large_full_modul.glb SA KONTROLOM VIDLJIVOSTI GRUPA
+        // ═══════════════════════════════════════════════════════════════
+        
+        const moduleGroup = new THREE.Group();
+        moduleGroup.name = `module-${m.id}`;
+        
+        // Fiksne dimenzije - zavisi od tipa modula
+        const FIXED_WIDTH = m.type === 'large' ? 4.8 : 2.4;  // Large: 2 ćelije (4.8m), Small: 1 ćelija (2.4m)
+        const FIXED_DEPTH = m.type === 'large' ? 2.4 : 2.4;  // Large: 1 ćelija (2.4m), Small: 1 ćelija (2.4m)
+        
+        // Izračunaj grid poziciju
+        const { w: gridW, h: gridH } = moduleSize(m);
+        const gridX = m.col * 2.4;
+        const gridZ = m.row * 2.4;
+        const footprintWidth = gridW * 2.4;
+        const footprintDepth = gridH * 2.4;
+        const footprintCenterX = gridX + footprintWidth / 2;
+        const footprintCenterZ = gridZ + footprintDepth / 2;
+        
+        // Učitaj GLB fajl (large_full.glb ili small_full.glb)
+        loader.load(`/modules/${m.glbFile}`, (gltf) => {
+          const modulModel = gltf.scene.clone();
+          modulModel.name = m.type === 'large' ? 'large-full' : m.type === 'medium' ? 'medium-full' : 'small-full';
+          
+          // Pronađi sve grupe po imenu (12 grupa)
+          const konstrukcijaGroup = modulModel.getObjectByName('konstrukcija');
+          const stakleniKrovGroup = modulModel.getObjectByName('stakleni_krov');
+          const fasada2PunZidGroup = modulModel.getObjectByName('fasada_2_pun_zid');
+          const fasada1SaVratimaGroup = modulModel.getObjectByName('fasada_1_sa_vratima');
+          const fasada1BezVrataGroup = modulModel.getObjectByName('fasada_1_bez_vrata');
+          const fasada4PodiznoKliznaGroup = modulModel.getObjectByName('fasada_4_podizno_klizniiiiiii');
+          const fasada4FixGroup = modulModel.getObjectByName('fasada_4_fix');
+          const fasada4KupatiloProzorGroup = modulModel.getObjectByName('fasada_4_kupatilo_prozor');
+          const fasada3ProzorSpavacaGroup = modulModel.getObjectByName('fasada_3_prozor_spavaca');
+          const fasada3PunZidGroup = modulModel.getObjectByName('fasada_3_pun_zid');
+          const krovPunGroup = modulModel.getObjectByName('krov_pun');
+          const fasada4PunZidGroup = modulModel.getObjectByName('fasada_4_pun_zid');
+          // Medium-specific groups (small_v2_full.glb)
+          const fasada1PodiznoKliznaGroup = modulModel.getObjectByName('fasada_1_podizno_klizniiiiiii');
+          const fasada1FixGroup = modulModel.getObjectByName('fasada_1_fix');
+          const fasada2PodiznoKliznaGroup = modulModel.getObjectByName('fasada_2_podizno_klizniiiiiii');
+          const fasada2FixGroup = modulModel.getObjectByName('fasada_2_fix');
+          const fasada3PodiznoKliznaGroup = modulModel.getObjectByName('fasada_3_podizno_klizniiiiiii');
+          const fasada3FixGroup = modulModel.getObjectByName('fasada_3_fix');
+          const fasada1PunZidGroup = modulModel.getObjectByName('fasada_1_pun_zid');
+          
+          // Izmeri model
+          const bbox = new THREE.Box3().setFromObject(modulModel);
+          const originalSize = bbox.getSize(new THREE.Vector3());
+          
+          // Uniformno skaliranje - Small modul treba dodatno da se smanji jer je 1x1 umesto 2x1
+          const scaleX = FIXED_WIDTH / originalSize.x;
+          const scaleZ = FIXED_DEPTH / originalSize.z;
+          let uniformScale = Math.min(scaleX, scaleZ);
+          
+          modulModel.scale.set(uniformScale, uniformScale, uniformScale);
+          
+          // Update i izmeri
+          modulModel.updateMatrixWorld(true);
+          const bboxScaled = new THREE.Box3().setFromObject(modulModel);
+          const centerScaled = bboxScaled.getCenter(new THREE.Vector3());
+          
+          // Pozicioniranje u lokalnom koordinatnom sistemu grupe
+          modulModel.position.set(
+            -centerScaled.x,
+            -bboxScaled.min.y,  // Postavi na tlo
+            -centerScaled.z
+          );
+          
+          // Kontrola vidljivosti svih grupa (12 grupa)
+          if (konstrukcijaGroup) konstrukcijaGroup.visible = m.hasKonstrukcija;
+          if (stakleniKrovGroup) stakleniKrovGroup.visible = m.hasStakleniKrov;
+          if (fasada2PunZidGroup) fasada2PunZidGroup.visible = m.hasFasada2PunZid;
+          if (fasada1SaVratimaGroup) fasada1SaVratimaGroup.visible = m.hasFasada1SaVratima;
+          if (fasada1BezVrataGroup) fasada1BezVrataGroup.visible = m.hasFasada1BezVrata;
+          if (fasada4PodiznoKliznaGroup) fasada4PodiznoKliznaGroup.visible = m.hasFasada4PodiznoKlizna;
+          if (fasada4FixGroup) fasada4FixGroup.visible = m.hasFasada4Fix;
+          if (fasada4KupatiloProzorGroup) fasada4KupatiloProzorGroup.visible = m.hasFasada4KupatiloProzor;
+          if (fasada3ProzorSpavacaGroup) fasada3ProzorSpavacaGroup.visible = m.hasFasada3ProzorSpavaca;
+          if (fasada3PunZidGroup) fasada3PunZidGroup.visible = m.hasFasada3PunZid;
+          if (krovPunGroup) krovPunGroup.visible = m.hasKrovPun;
+          if (fasada4PunZidGroup) fasada4PunZidGroup.visible = m.hasFasada4PunZid;
+          if (fasada1PodiznoKliznaGroup) fasada1PodiznoKliznaGroup.visible = m.hasFasada1PodiznoKlizna;
+          if (fasada1FixGroup) fasada1FixGroup.visible = m.hasFasada1Fix;
+          if (fasada2PodiznoKliznaGroup) fasada2PodiznoKliznaGroup.visible = m.hasFasada2PodiznoKlizna;
+          if (fasada2FixGroup) fasada2FixGroup.visible = m.hasFasada2Fix;
+          if (fasada3PodiznoKliznaGroup) fasada3PodiznoKliznaGroup.visible = m.hasFasada3PodiznoKlizna;
+          if (fasada3FixGroup) fasada3FixGroup.visible = m.hasFasada3Fix;
+          if (fasada1PunZidGroup) fasada1PunZidGroup.visible = m.hasFasada1PunZid;
+          
+          // Setup senki
+          modulModel.traverse((child) => {
+            if ((child as THREE.Mesh).isMesh) {
+              child.castShadow = true;
+              child.receiveShadow = true;
+            }
+          });
+          
+          // Dodaj u grupu
+          moduleGroup.add(modulModel);
+        }, undefined, (err) => console.warn(`[${m.glbFile}] load error:`, err));
+        
+        // Rotiraj celu grupu
+        moduleGroup.rotation.y = -m.rotation * (Math.PI / 2);
+        
+        // Pozicioniraj celu grupu na grid
+        moduleGroup.position.set(footprintCenterX, 0, footprintCenterZ);
+        
+        // Dodaj grupu u scenu
+        scene.add(moduleGroup);
+        customMeshes.push(moduleGroup);
+      });
+    }
+
+    // OrbitControls — target the layout centre
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping  = true;
+    controls.dampingFactor  = 0.06;
+    controls.target.set(centerX, 0, centerZ);
+    controls.minDistance    = 4;
+    controls.maxDistance    = 200;
+    controls.maxPolarAngle  = Math.PI / 2 - 0.02;
+    controls.update();
+
+    // Render loop
+    let animId: number;
+    const animate = () => {
+      animId = requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    // Responsive resize
+    const observer = new ResizeObserver(() => {
+      const rw = mount.clientWidth;
+      const rh = mount.clientHeight;
+      camera.aspect = rw / rh;
+      camera.updateProjectionMatrix();
+      renderer.setSize(rw, rh);
+    });
+    observer.observe(mount);
+
+    return () => {
+      cancelAnimationFrame(animId);
+      observer.disconnect();
+      controls.dispose();
+      renderer.dispose();
+      customMeshes.forEach(obj => scene.remove(obj));
+      if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
+    };
+  // Re-init when modules, cols, or rows change
+  }, [modules, cols, rows]);
+
+  return (
+    <div style={{ position: 'absolute', inset: 0 }}>
+      <div ref={mountRef} style={{ position: 'absolute', inset: 0 }} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Page component
+// ---------------------------------------------------------------------------
+export default function Home() {
+  const [modules, setModules] = useState<PlacedModule[]>([]);
+  const [drag,    setDrag]    = useState<DragState | null>(null);
+  const [zoom,    setZoom]    = useState(1);
+  const [view,    setView]    = useState<'2d' | '3d'>('2d');
+  const [cols,    setCols]    = useState(DEFAULT_COLS);
+  const [rows,    setRows]    = useState(DEFAULT_ROWS);
+  const [genSmall, setGenSmall] = useState(2);
+  const [genLarge, setGenLarge] = useState(4);
+  const [genTall,  setGenTall]  = useState(0);
+  
+  // Module options modal
+  const [optionsModalOpen, setOptionsModalOpen] = useState(false);
+  const [editingModuleId, setEditingModuleId] = useState<string | null>(null);
+  
+  const gridRef   = useRef<HTMLDivElement>(null);
+  const scrollRef  = useRef<HTMLDivElement>(null);
+  const needsCenterRef = useRef(false);
+  // Mutable ref so drag event handlers always see the latest zoom without stale closures
+  const zoomRef   = useRef(zoom);
+  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+
+  // Auto-expand grid when a module gets within GRID_MARGIN cells of an edge
+  useEffect(() => {
+    if (modules.length === 0) return;
+    let newCols = cols;
+    let newRows = rows;
+    for (const m of modules) {
+      const { w, h } = moduleSize(m);
+      if (m.col + w >= cols - GRID_MARGIN) newCols = Math.max(newCols, m.col + w + GRID_MARGIN + GRID_EXPAND);
+      if (m.row + h >= rows - GRID_MARGIN) newRows = Math.max(newRows, m.row + h + GRID_MARGIN + GRID_EXPAND);
+    }
+    if (newCols !== cols) setCols(newCols);
+    if (newRows !== rows) setRows(newRows);
+  }, [modules, cols, rows]);
+
+  const changeZoom = (delta: number) =>
+    setZoom(prev => parseFloat(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev + delta)).toFixed(2)));
+
+  // ---- Add module ----
+  const addModule = (type: ModuleType) => {
+    const pos = firstFreePosition(type, 0, modules, cols, rows);
+    if (!pos) return; // grid full
+    
+    // Odaberi GLB fajl na osnovu tipa
+    const glbFile = type === 'large' ? 'large_full_final.glb' : type === 'medium' ? 'small_v2_full.glb' : 'small_full.glb';
+    const isMedium = type === 'medium';
+    const isSmall = type === 'small';
+    const isLarge = type === 'large';
+    
+    setModules(prev => [
+      ...prev,
+      { 
+        id: crypto.randomUUID(), 
+        type, 
+        glbFile,
+        hasKonstrukcija: true,
+        hasStakleniKrov: true,
+        hasFasada2PunZid: true,
+        hasFasada1SaVratima: isLarge,
+        hasFasada1BezVrata: isLarge,
+        hasFasada4PodiznoKlizna: true,
+        hasFasada4Fix: true,
+        hasFasada4KupatiloProzor: isLarge,
+        hasFasada3ProzorSpavaca: isLarge,
+        hasFasada3PunZid: true,
+        hasKrovPun: true,
+        hasFasada4PunZid: true,
+        hasFasada1PodiznoKlizna: isMedium || isSmall,
+        hasFasada1Fix: isMedium || isSmall,
+        hasFasada2PodiznoKlizna: isMedium || isSmall,
+        hasFasada2Fix: isMedium || isSmall,
+        hasFasada3PodiznoKlizna: isMedium || isSmall,
+        hasFasada3Fix: isMedium || isSmall,
+        hasFasada1PunZid: isMedium || isSmall,
+        col: pos.col, 
+        row: pos.row, 
+        rotation: 0 
+      },
+    ]);
+  };
+
+  // ---- Remove module ----
+  const removeModule = (id: string) => {
+    setModules(prev => prev.filter(m => m.id !== id));
+  };
+
+  // ---- Rotate module ----
+  const rotateModule = (id: string) => {
+    setModules(prev =>
+      prev.map(m => {
+        if (m.id !== id) return m;
+        const rotation = ((m.rotation + 1) % 4) as 0 | 1 | 2 | 3;
+        const newSize  = rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 };
+        const col      = Math.min(m.col, cols - newSize.w);
+        const row      = Math.min(m.row, rows - newSize.h);
+        const updated  = { ...m, rotation, col, row };
+        const others   = prev.filter(o => o.id !== id);
+        if (others.some(o => overlaps(updated, o))) return m;
+        return updated;
+      }),
+    );
+  };
+
+  // ---- Toggle grupe iz large_full_modul.glb ----
+  const toggleKonstrukcija = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasKonstrukcija: !m.hasKonstrukcija } : m));
+  };
+  const toggleStakleniKrov = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasStakleniKrov: !m.hasStakleniKrov } : m));
+  };
+  const toggleFasada2PunZid = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada2PunZid: !m.hasFasada2PunZid } : m));
+  };
+  const toggleFasada1SaVratima = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1SaVratima: !m.hasFasada1SaVratima } : m));
+  };
+  const toggleFasada1BezVrata = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1BezVrata: !m.hasFasada1BezVrata } : m));
+  };
+  const toggleFasada4PodiznoKlizna = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada4PodiznoKlizna: !m.hasFasada4PodiznoKlizna } : m));
+  };
+  const toggleFasada4Fix = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada4Fix: !m.hasFasada4Fix } : m));
+  };
+  const toggleFasada4KupatiloProzor = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada4KupatiloProzor: !m.hasFasada4KupatiloProzor } : m));
+  };
+  const toggleFasada3ProzorSpavaca = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada3ProzorSpavaca: !m.hasFasada3ProzorSpavaca } : m));
+  };
+  const toggleFasada3PunZid = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada3PunZid: !m.hasFasada3PunZid } : m));
+  };
+  const toggleKrovPun = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasKrovPun: !m.hasKrovPun } : m));
+  };
+  const toggleFasada4PunZid = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada4PunZid: !m.hasFasada4PunZid } : m));
+  };
+
+  // ---- Toggle grupe iz small_v2_full.glb (medium tip) ----
+  const toggleFasada1PodiznoKlizna = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1PodiznoKlizna: !m.hasFasada1PodiznoKlizna } : m));
+  };
+  const toggleFasada1Fix = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1Fix: !m.hasFasada1Fix } : m));
+  };
+  const toggleFasada2PodiznoKlizna = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada2PodiznoKlizna: !m.hasFasada2PodiznoKlizna } : m));
+  };
+  const toggleFasada2Fix = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada2Fix: !m.hasFasada2Fix } : m));
+  };
+  const toggleFasada3PodiznoKlizna = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada3PodiznoKlizna: !m.hasFasada3PodiznoKlizna } : m));
+  };
+  const toggleFasada3Fix = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada3Fix: !m.hasFasada3Fix } : m));
+  };
+  const toggleFasada1PunZid = (id: string) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, hasFasada1PunZid: !m.hasFasada1PunZid } : m));
+  };
+
+  // Open options modal
+  const openOptionsModal = (id: string) => {
+    setEditingModuleId(id);
+    setOptionsModalOpen(true);
+  };
+
+  // ---- Generate layout ----
+  const handleGenerate = () => {
+    if (genSmall === 0 && genLarge === 0 && genTall === 0) return;
+    needsCenterRef.current = true;
+    setModules(generateLayout(genSmall, genLarge, genTall, cols, rows));
+  };
+
+  // ---- Save layout ----
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
+  const handleSaveLayout = async () => {
+    if (modules.length === 0) return;
+    setSaveStatus('saving');
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { setSaveStatus('error'); return; }
+    const area = modules.reduce((sum, m) => {
+      const { w, h } = moduleSize(m);
+      return sum + w * 2.4 * h * 2.4;
+    }, 0);
+    const { error } = await supabase.from('layouts').insert({
+      user_id: user.id,
+      layout: modules,
+      large_count: 0,
+      small_count: 0,
+      tall_count:  null,
+      total_area_m2: parseFloat(area.toFixed(2)),
+    });
+    if (error) { setSaveStatus('error'); setTimeout(() => setSaveStatus('idle'), 3000); }
+    else { setSaveStatus('saved'); setTimeout(() => setSaveStatus('idle'), 2500); }
+  };
+
+  // ---- Logout ----
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    window.location.href = '/login';
+  };
+
+  // ---- Export PDF ----
+  const handleExportPDF = () => {
+    if (modules.length === 0) return;
+    let minC = Infinity, minR = Infinity, maxC = -Infinity, maxR = -Infinity;
+    for (const m of modules) {
+      const { w, h } = moduleSize(m);
+      if (m.col < minC) minC = m.col;
+      if (m.row < minR) minR = m.row;
+      if (m.col + w > maxC) maxC = m.col + w;
+      if (m.row + h > maxR) maxR = m.row + h;
+    }
+    const SCALE = 84;
+    const PAD = 40;
+    const svgW = (maxC - minC) * SCALE + PAD * 2;
+    const svgH = (maxR - minR) * SCALE + PAD * 2;
+    // grid lines behind modules
+    const gridLines: string[] = [];
+    for (let c = 0; c <= maxC - minC; c++) {
+      const x = c * SCALE + PAD;
+      gridLines.push(`<line x1="${x}" y1="${PAD}" x2="${x}" y2="${svgH - PAD}" stroke="#e8eaed" stroke-width="0.5"/>`);
+    }
+    for (let r = 0; r <= maxR - minR; r++) {
+      const y = r * SCALE + PAD;
+      gridLines.push(`<line x1="${PAD}" y1="${y}" x2="${svgW - PAD}" y2="${y}" stroke="#e8eaed" stroke-width="0.5"/>`);
+    }
+    const rects = modules.map((m, idx) => {
+      const { w, h } = moduleSize(m);
+      const x = (m.col - minC) * SCALE + PAD;
+      const y = (m.row - minR) * SCALE + PAD;
+      
+      // Color scheme based on module type and components visibility
+      let svgFill: string;
+      let svgStroke: string;
+      let svgLabel: string;
+      if (m.type === 'medium' || m.type === 'small') {
+        const activeCount = [m.hasKonstrukcija, m.hasStakleniKrov, m.hasFasada2PunZid, m.hasFasada3PunZid, m.hasFasada4PunZid, m.hasFasada4PodiznoKlizna, m.hasFasada4Fix, m.hasKrovPun, m.hasFasada1PodiznoKlizna, m.hasFasada1Fix, m.hasFasada2PodiznoKlizna, m.hasFasada2Fix, m.hasFasada3PodiznoKlizna, m.hasFasada3Fix, m.hasFasada1PunZid].filter(Boolean).length;
+        svgLabel = activeCount === 0 ? 'PRAZAN' : activeCount === 15 ? 'KOMPLETAN' : `${activeCount}/15`;
+        svgFill = m.type === 'medium' ? '#f97316' : '#3b82f6';
+        svgStroke = m.type === 'medium' ? '#ea580c' : '#2563eb';
+      } else {
+        const activeCount = [m.hasKonstrukcija, m.hasStakleniKrov, m.hasFasada2PunZid, m.hasFasada1SaVratima, m.hasFasada1BezVrata, m.hasFasada4PodiznoKlizna, m.hasFasada4Fix, m.hasFasada4KupatiloProzor, m.hasFasada3ProzorSpavaca, m.hasFasada3PunZid, m.hasKrovPun, m.hasFasada4PunZid].filter(Boolean).length;
+        svgLabel = activeCount === 0 ? 'PRAZAN' : activeCount === 12 ? 'KOMPLETAN' : `${activeCount}/12`;
+        svgFill = '#22c55e'; 
+        svgStroke = '#16a34a';
+      }
+      const colors = { fill: svgFill, stroke: svgStroke, label: svgLabel };
+      
+      const tc      = '#ffffff';
+      const tc2     = 'rgba(255,255,255,0.65)';
+      const size    = m.type === 'large' ? (w === 2 ? '4.8 × 2.4 m' : '2.4 × 4.8 m') : '2.4 × 2.4 m';
+      const numX    = x + w * SCALE - 10;
+      const numY    = y + 14;
+      const cx      = x + w * SCALE / 2;
+      const cy      = y + h * SCALE / 2;
+      return [
+        `<rect x="${x+2}" y="${y+2}" width="${w*SCALE-4}" height="${h*SCALE-4}" rx="8" fill="${colors.fill}" stroke="${colors.stroke}" stroke-width="1"/>`,
+        `<text x="${numX}" y="${numY}" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" font-weight="500" fill="${tc2}" text-anchor="end">${idx + 1}</text>`,
+        `<text x="${cx}" y="${cy - 6}" font-family="'Inter','Helvetica Neue',sans-serif" font-size="10" font-weight="700" fill="${tc}" text-anchor="middle" letter-spacing="0.06em">${colors.label}</text>`,
+        `<text x="${cx}" y="${cy + 10}" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="${tc2}" text-anchor="middle">${size}</text>`,
+      ].join('');
+    }).join('');
+    // legend
+    const legend = `<g transform="translate(${PAD},${svgH - 18})">
+      <rect x="0" y="-7" width="10" height="10" rx="2" fill="#6366f1"/>
+      <text x="14" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Custom</text>
+      <rect x="80" y="-7" width="10" height="10" rx="2" fill="#22c55e"/>
+      <text x="94" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Empty</text>
+      <rect x="150" y="-7" width="10" height="10" rx="2" fill="#fb923c"/>
+      <text x="164" y="1" font-family="'Inter','Helvetica Neue',sans-serif" font-size="8" fill="#9098a8">Full Roof</text>
+    </g>`;
+    const bboxW = bbox ? bbox.w.toFixed(1) : '—';
+    const bboxH = bbox ? bbox.h.toFixed(1) : '—';
+    const date  = new Date().toLocaleDateString('sr-Latn-RS', { year: 'numeric', month: 'long', day: 'numeric' });
+    const refNo = `MH-GLB-${new Date().getFullYear()}-${String(modules.length).padStart(3,'0')}`;
+    const totalAreaVal = totalArea.toFixed(2);
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Modular Houses – GLB Layout</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+@page{margin:0}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;color:#1a1a2e;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.page{background:#fff;max-width:860px;margin:0 auto;min-height:100vh}
+/* ── HEADER BAND ── */
+.header-band{background:#000000;padding:28px 52px;display:flex;align-items:center;justify-content:space-between}
+.header-band img{height:34px;filter:brightness(0) invert(1)}
+.header-right{text-align:right}
+.header-ref{font-size:9px;letter-spacing:.12em;color:#ffffff;text-transform:uppercase;font-weight:600;margin-bottom:4px}
+.header-date{font-size:13px;color:#ffffff;font-weight:700}
+.header-email{font-size:11px;color:#ffffff;margin-top:3px}
+/* ── BODY ── */
+.body{padding:44px 52px 52px}
+/* ── TITLE ROW ── */
+.title-row{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:32px;padding-bottom:20px;border-bottom:2px solid #f0f2f5}
+.doc-title{font-size:22px;font-weight:700;color:#000000;letter-spacing:-.02em}
+.doc-sub{font-size:12px;color:#9098a8;font-weight:500;margin-top:4px}
+.badge{background:#000000;color:#ffffff;font-size:10px;font-weight:700;letter-spacing:.06em;padding:5px 10px;border-radius:6px;border:1px solid #333333}
+/* ── STATS ── */
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:36px}
+.stat{background:#f8f9fb;border:1px solid #eaecf0;border-radius:10px;padding:16px 14px;position:relative;overflow:hidden}
+.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:#000000;border-radius:10px 10px 0 0}
+.stat-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#9098a8;font-weight:600;margin-bottom:8px}
+.stat-value{font-size:18px;font-weight:700;color:#000000;line-height:1}
+.stat-unit{font-size:11px;font-weight:500;color:#9098a8;margin-left:2px}
+/* ── LAYOUT BOX ── */
+.section-label{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#9098a8;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.section-label::after{content:'';flex:1;height:1px;background:#eaecf0}
+.layout-box{background:#f8f9fb;border:1px solid #eaecf0;border-radius:12px;padding:32px;margin-bottom:36px;display:flex;justify-content:center;align-items:center;overflow:auto}
+/* ── FOOTER ── */
+.footer{margin-top:52px;padding-top:20px;border-top:1px solid #eaecf0;display:flex;justify-content:space-between;align-items:center}
+.footer-left{font-size:10px;color:#c0c8d4}
+.footer-right{font-size:10px;color:#c0c8d4;text-align:right}
+@media print{body{background:#fff}.page{max-width:none}}
+</style>
+</head><body><div class="page">
+<div class="header-band">
+  <img src="${window.location.origin}/modular-dark.png" onerror="this.style.display='none'">
+  <div class="header-right">
+    <div class="header-ref">Ref. ${refNo}</div>
+    <div class="header-date">${date}</div>
+    <div class="header-email">info@modularhouses.rs</div>
+  </div>
+</div>
+<div class="body">
+  <div class="title-row">
+    <div>
+      <div class="doc-title">Specifikacija rasporeda modula</div>
+      <div class="doc-sub">Modular Houses — generisani layout</div>
+    </div>
+    <div class="badge">NACRT / DRAFT</div>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="stat-label">Ukupno modula</div><div class="stat-value">${modules.length}<span class="stat-unit">mod.</span></div></div>
+    <div class="stat"><div class="stat-label">Sa konstrukcijom</div><div class="stat-value">${modules.filter(m => m.hasKonstrukcija).length}<span class="stat-unit">mod.</span></div></div>
+    <div class="stat"><div class="stat-label">Sa krovom pun</div><div class="stat-value">${modules.filter(m => m.hasKrovPun).length}<span class="stat-unit">mod.</span></div></div>
+    <div class="stat"><div class="stat-label">Sa staklenim krovom</div><div class="stat-value">${modules.filter(m => m.hasStakleniKrov).length}<span class="stat-unit">mod.</span></div></div>
+    <div class="stat"><div class="stat-label">Gabarit</div><div class="stat-value" style="font-size:14px">${bboxW}<span class="stat-unit">×</span>${bboxH}<span class="stat-unit">m</span></div></div>
+    <div class="stat"><div class="stat-label">Ukupna površina</div><div class="stat-value" style="font-size:16px">${totalAreaVal}<span class="stat-unit">m²</span></div></div>
+  </div>
+  <div class="section-label">Raspored modula</div>
+  <div class="layout-box">
+    <svg width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}" xmlns="http://www.w3.org/2000/svg">
+      ${gridLines.join('')}${rects}${legend}
+    </svg>
+  </div>
+  <div class="footer">
+    <div class="footer-left">Modular Houses d.o.o. · info@modularhouses.rs</div>
+    <div class="footer-right">Dokument generisan automatski — nije zamena za tehnički projekat.</div>
+  </div>
+</div>
+</div><script>window.onload=()=>{window.print()}<\/script></body></html>`;
+    const win = window.open('', '_blank');
+    if (win) { win.document.write(html); win.document.close(); }
+  };
+
+  // ---- Scroll 2D to center the generated layout ----
+  useEffect(() => {
+    if (!needsCenterRef.current || modules.length === 0 || !scrollRef.current) return;
+    needsCenterRef.current = false;
+    let minC = Infinity, minR = Infinity, maxC = -Infinity, maxR = -Infinity;
+    for (const m of modules) {
+      const { w, h } = moduleSize(m);
+      if (m.col < minC) minC = m.col;
+      if (m.row < minR) minR = m.row;
+      if (m.col + w > maxC) maxC = m.col + w;
+      if (m.row + h > maxR) maxR = m.row + h;
+    }
+    const PADDING = 32;
+    const cx = PADDING + (minC + maxC) / 2 * CELL * zoom;
+    const cy = PADDING + (minR + maxR) / 2 * CELL * zoom;
+    const el = scrollRef.current;
+    el.scrollTo({ left: cx - el.clientWidth / 2, top: cy - el.clientHeight / 2, behavior: 'smooth' });
+  }, [modules, zoom]);
+
+  // ---- Drag start ----
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent, id: string) => {
+      e.preventDefault();
+      const m = modules.find(m => m.id === id);
+      if (!m || !gridRef.current) return;
+      const rect    = gridRef.current.getBoundingClientRect();
+      const z       = zoomRef.current;
+      // Divide screen-pixel offset by zoom to get logical-pixel offset
+      const offsetX = (e.clientX - rect.left) / z - m.col * CELL;
+      const offsetY = (e.clientY - rect.top)  / z - m.row * CELL;
+      setDrag({ id, offsetX, offsetY, ghostCol: m.col, ghostRow: m.row });
+    },
+    [modules],
+  );
+
+  // ---- Drag move + drop ----
+  useEffect(() => {
+    if (!drag) return;
+
+    const onMove = (e: MouseEvent) => {
+      const rect = gridRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const z    = zoomRef.current;
+      // Convert screen pixels → logical pixels → cell units, snap to 0.5
+      const rawX = (e.clientX - rect.left) / z - drag.offsetX;
+      const rawY = (e.clientY - rect.top)  / z - drag.offsetY;
+      const snap = (v: number) => Math.round(v / CELL * 2) / 2;
+      setDrag(d =>
+        d ? { ...d, ghostCol: snap(rawX), ghostRow: snap(rawY) } : null,
+      );
+    };
+
+    const onUp = () => {
+      if (!drag) return;
+      const m = modules.find(m => m.id === drag.id);
+      if (m) {
+        const candidate = { ...m, col: drag.ghostCol, row: drag.ghostRow };
+        const others    = modules.filter(o => o.id !== drag.id);
+        const valid     = inBounds(candidate, cols, rows) && !others.some(o => overlaps(candidate, o));
+        if (valid) {
+          setModules(prev =>
+            prev.map(mod => (mod.id === drag.id ? { ...mod, col: drag.ghostCol, row: drag.ghostRow } : mod)),
+          );
+        }
+      }
+      setDrag(null);
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup',   onUp);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drag, modules]);
+
+  // ---- Ghost validity ----
+  const draggingModule = drag ? modules.find(m => m.id === drag.id) : null;
+  const ghostValid = draggingModule
+    ? (() => {
+        const candidate = { ...draggingModule, col: drag!.ghostCol, row: drag!.ghostRow };
+        const others    = modules.filter(o => o.id !== drag!.id);
+        return inBounds(candidate, cols, rows) && !others.some(o => overlaps(candidate, o));
+      })()
+    : false;
+
+  // ---- Bounding box + area ----
+  const bbox = modules.length === 0 ? null : (() => {
+    let minC = Infinity, minR = Infinity, maxC = -Infinity, maxR = -Infinity;
+    for (const m of modules) {
+      const { w, h } = moduleSize(m);
+      if (m.col < minC)     minC = m.col;
+      if (m.row < minR)     minR = m.row;
+      if (m.col + w > maxC) maxC = m.col + w;
+      if (m.row + h > maxR) maxR = m.row + h;
+    }
+    return { w: (maxC - minC) * 2.4, h: (maxR - minR) * 2.4 };
+  })();
+  const totalArea = modules.reduce((sum, m) => {
+    const { w, h } = moduleSize(m);
+    return sum + w * h * 5.76;
+  }, 0);
+
+  // ---- Wheel zoom (Ctrl/Cmd + scroll or pinch trackpad) ----
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    setZoom(prev =>
+      parseFloat(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev - e.deltaY * 0.002)).toFixed(2)),
+    );
+  }, []);
+
+  // ---- Render ----
+  return (
+    <div
+      className="min-h-screen flex flex-col"
+      style={{ background: '#0f0f12', color: '#ffffff', userSelect: 'none' }}
+    >
+      <style>{`
+        @keyframes overlay-in { from { opacity: 0 } to { opacity: 1 } }
+        @keyframes card-in { from { opacity: 0; transform: translate(-50%,-50%) scale(0.92) } to { opacity: 1; transform: translate(-50%,-50%) scale(1) } }
+        @keyframes spin { to { transform: rotate(360deg) } }
+        @keyframes check-in { from { opacity:0; transform:scale(0.5) } to { opacity:1; transform:scale(1) } }
+      `}</style>
+
+      {/* ── Save overlay ── */}
+      {(saveStatus === 'saving' || saveStatus === 'saved') && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)',
+          animation: 'overlay-in 0.18s ease',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            position: 'fixed', top: '50%', left: '50%',
+            transform: 'translate(-50%,-50%)',
+            background: '#141418', border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: 20, padding: '36px 48px',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16,
+            animation: 'card-in 0.22s cubic-bezier(0.34,1.56,0.64,1)',
+            minWidth: 240,
+          }}>
+            {saveStatus === 'saving' ? (
+              <>
+                <div style={{
+                  width: 44, height: 44,
+                  border: '3px solid rgba(255,255,255,0.08)',
+                  borderTop: '3px solid rgba(255,255,255,0.7)',
+                  borderRadius: '50%',
+                  animation: 'spin 0.7s linear infinite',
+                }}/>
+                <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 14, margin: 0 }}>Čuvam raspored...</p>
+              </>
+            ) : (
+              <>
+                <div style={{
+                  width: 52, height: 52, borderRadius: '50%',
+                  background: 'rgba(34,197,94,0.15)', border: '1px solid rgba(34,197,94,0.35)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  animation: 'check-in 0.25s cubic-bezier(0.34,1.56,0.64,1)',
+                }}>
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="rgb(134,239,172)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="20 6 9 17 4 12"/>
+                  </svg>
+                </div>
+                <div style={{ textAlign: 'center' }}>
+                  <p style={{ color: '#fff', fontSize: 15, fontWeight: 600, margin: '0 0 4px' }}>Raspored sačuvan</p>
+                  <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, margin: 0 }}>Uspešno dodat u bazu</p>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Toolbar ──────────────────────────────────────────────── */}
+      <header style={{
+        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        background: '#0d0d10',
+        display: 'flex',
+        alignItems: 'center',
+        padding: '0 16px',
+        height: 56,
+        flexShrink: 0,
+        position: 'relative',
+        fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif',
+      }}>
+        {/* ── Left: Logo + Add buttons ── */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginRight: 6 }}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/modular-logo.svg" alt="Modular" style={{ height: 28, width: 'auto', flexShrink: 0 }} />
+          </div>
+
+          <div style={{ width: 1, height: 20, background: 'rgba(255,255,255,0.07)', flexShrink: 0, margin: '0 4px' }} />
+
+          {/* Add modules */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              onClick={() => addModule('large')}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                background: 'rgba(34,197,94,0.15)', border: '1px solid rgba(34,197,94,0.35)',
+                borderRadius: 8, padding: '6px 11px',
+                color: 'rgba(134,239,172,0.95)', cursor: 'pointer',
+                fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s',
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(34,197,94,0.25)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(34,197,94,0.15)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(134,239,172,0.95)';
+              }}
+            >
+              <span style={{ fontSize: 18, lineHeight: 1, fontWeight: 200, color: 'rgba(134,239,172,0.6)', marginBottom: 1 }}>+</span>
+              <span>Veliki Modul</span>
+            </button>
+
+            <button
+              onClick={() => addModule('small')}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                background: 'rgba(59,130,246,0.15)', border: '1px solid rgba(59,130,246,0.35)',
+                borderRadius: 8, padding: '6px 11px',
+                color: 'rgba(147,197,253,0.95)', cursor: 'pointer',
+                fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s',
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(59,130,246,0.25)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(59,130,246,0.15)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(147,197,253,0.95)';
+              }}
+            >
+              <span style={{ fontSize: 18, lineHeight: 1, fontWeight: 200, color: 'rgba(147,197,253,0.6)', marginBottom: 1 }}>+</span>
+              <span>Mali Modul</span>
+            </button>
+
+            <button
+              onClick={() => addModule('medium')}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                background: 'rgba(249,115,22,0.15)', border: '1px solid rgba(249,115,22,0.35)',
+                borderRadius: 8, padding: '6px 11px',
+                color: 'rgba(253,186,116,0.95)', cursor: 'pointer',
+                fontSize: 13, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s',
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(249,115,22,0.25)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(249,115,22,0.15)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(253,186,116,0.95)';
+              }}
+            >
+              <span style={{ fontSize: 18, lineHeight: 1, fontWeight: 200, color: 'rgba(253,186,116,0.6)', marginBottom: 1 }}>+</span>
+              <span>Veliki modul</span>
+            </button>
+          </div>
+        </div>
+
+        {/* ── Center: GLB Mode Label (absolutely centered) ── */}
+        <div style={{
+          position: 'absolute', left: '50%', top: '50%',
+          transform: 'translate(-50%, -50%)',
+          display: 'flex', alignItems: 'center', gap: 8,
+          background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)',
+          borderRadius: 8, padding: '6px 16px',
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'rgba(180,180,255,0.9)', letterSpacing: '0.02em' }}>GLB Mode</span>
+        </div>
+
+        {/* Hidden generator controls - keep for backward compatibility */}
+        <div style={{ display: 'none' }}>
+          {/* Mali stepper */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <span style={{ fontSize: 13, fontWeight: 500, color: '#71717a', whiteSpace: 'nowrap' }}>Mali</span>
+            <div style={{ display: 'flex', alignItems: 'center', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, overflow: 'hidden' }}>
+              <button
+                onClick={() => setGenSmall(s => Math.max(0, s - 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >−</button>
+              <span style={{ width: 36, textAlign: 'center', fontSize: 15, fontWeight: 700, color: 'rgba(255,255,255,0.9)', fontVariantNumeric: 'tabular-nums', userSelect: 'none' }}>{genSmall}</span>
+              <button
+                onClick={() => setGenSmall(s => Math.min(40, s + 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >+</button>
+            </div>
+          </div>
+
+          <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
+
+          {/* Visoki stepper */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <span style={{ fontSize: 13, fontWeight: 500, color: '#dc2626', whiteSpace: 'nowrap' }}>Visoki</span>
+            <div style={{ display: 'flex', alignItems: 'center', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, overflow: 'hidden' }}>
+              <button
+                onClick={() => setGenTall(s => Math.max(0, s - 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >−</button>
+              <span style={{ width: 36, textAlign: 'center', fontSize: 15, fontWeight: 700, color: 'rgba(255,255,255,0.9)', fontVariantNumeric: 'tabular-nums', userSelect: 'none' }}>{genTall}</span>
+              <button
+                onClick={() => setGenTall(s => Math.min(20, s + 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >+</button>
+            </div>
+          </div>
+
+          <div style={{ width: 1, height: 18, background: 'rgba(255,255,255,0.08)', flexShrink: 0 }} />
+
+          {/* Veliki stepper */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <span style={{ fontSize: 13, fontWeight: 500, color: 'rgba(255,255,255,0.6)', whiteSpace: 'nowrap' }}>Veliki</span>
+            <div style={{ display: 'flex', alignItems: 'center', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, overflow: 'hidden' }}>
+              <button
+                onClick={() => setGenLarge(s => Math.max(0, s - 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >−</button>
+              <span style={{ width: 36, textAlign: 'center', fontSize: 15, fontWeight: 700, color: 'rgba(255,255,255,0.9)', fontVariantNumeric: 'tabular-nums', userSelect: 'none' }}>{genLarge}</span>
+              <button
+                onClick={() => setGenLarge(s => Math.min(20, s + 1))}
+                style={{ width: 32, height: 32, border: 'none', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 18, fontWeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'background 0.1s, color 0.1s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)'; }}
+              >+</button>
+            </div>
+          </div>
+
+          {/* Generiši button */}
+          <button
+            onClick={handleGenerate}
+            disabled={genSmall === 0 && genLarge === 0 && genTall === 0}
+            style={{
+              background: genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.1)',
+              border: '1px solid rgba(255,255,255,0.13)',
+              borderRadius: 8, padding: '0 16px', height: 32,
+              color: genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.82)',
+              cursor: genSmall === 0 && genLarge === 0 && genTall === 0 ? 'not-allowed' : 'pointer',
+              fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap',
+              transition: 'all 0.12s',
+            }}
+            onMouseEnter={e => {
+              if (genSmall > 0 || genLarge > 0 || genTall > 0) {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.18)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }
+            }}
+            onMouseLeave={e => {
+              (e.currentTarget as HTMLButtonElement).style.background = genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.1)';
+              (e.currentTarget as HTMLButtonElement).style.color = genSmall === 0 && genLarge === 0 && genTall === 0 ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.82)';
+            }}
+          >
+            Generiši
+          </button>
+        </div>
+
+        {/* ── Right: Export + Delete + Zoom + 2D/3D ── */}
+        <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+          {modules.length > 0 && (
+            <button
+              onClick={handleSaveLayout}
+              disabled={saveStatus === 'saving'}
+              style={{
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 8, padding: '6px 13px',
+                color: saveStatus === 'error' ? '#f87171' : 'rgba(255,255,255,0.6)',
+                cursor: saveStatus === 'saving' ? 'wait' : 'pointer',
+                fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s', display: 'flex', alignItems: 'center', gap: 5,
+              }}
+              onMouseEnter={e => { if (saveStatus === 'idle') { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; e.currentTarget.style.color = '#fff'; } }}
+              onMouseLeave={e => { if (saveStatus === 'idle') { e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; } }}
+            >
+              {saveStatus === 'error' ? 'Greška' : 'Sačuvaj'}
+            </button>
+          )}
+
+          {modules.length > 0 && (
+            <button
+              onClick={handleExportPDF}
+              style={{
+                background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 8, padding: '6px 13px',
+                color: 'rgba(255,255,255,0.6)', cursor: 'pointer',
+                fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s', display: 'flex', alignItems: 'center', gap: 5,
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.12)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.06)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.6)';
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" style={{ opacity: 0.7 }}>
+                <path d="M3 4h2V1h6v3h2L8 9 3 4zm-1 8h12v2H2v-2z" fill="currentColor"/>
+              </svg>
+              PDF
+            </button>
+          )}
+
+          {modules.length > 0 && (
+            <button
+              onClick={() => setModules([])}
+              style={{
+                background: 'transparent', border: '1px solid rgba(255,255,255,0.07)',
+                borderRadius: 8, padding: '6px 13px',
+                color: 'rgba(255,255,255,0.25)', cursor: 'pointer',
+                fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s',
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.color = '#f87171';
+                (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(248,113,113,0.3)';
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(239,68,68,0.06)';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.25)';
+                (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(255,255,255,0.07)';
+                (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
+              }}
+            >
+              Obriši
+            </button>
+          )}
+
+          {/* Zoom controls — 2D only */}
+          {view === '2d' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+              <button
+                onClick={() => changeZoom(-ZOOM_STEP)}
+                disabled={zoom <= ZOOM_MIN}
+                title="Zoom out"
+                style={{
+                  width: 32, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  borderRadius: '7px 0 0 7px', border: '1px solid rgba(255,255,255,0.1)',
+                  background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 16,
+                  opacity: zoom <= ZOOM_MIN ? 0.3 : 1, transition: 'background 0.12s',
+                }}
+                onMouseEnter={e => { if (zoom > ZOOM_MIN) (e.currentTarget.style.background = 'rgba(255,255,255,0.09)'); }}
+                onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.04)')}
+              >−</button>
+              <button
+                onClick={() => setZoom(1)}
+                title="Reset zoom"
+                style={{
+                  minWidth: 50, height: 30,
+                  borderTop: '1px solid rgba(255,255,255,0.1)', borderBottom: '1px solid rgba(255,255,255,0.1)',
+                  borderLeft: 'none', borderRight: 'none',
+                  background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.42)', cursor: 'pointer',
+                  fontSize: 12, fontWeight: 600, fontVariantNumeric: 'tabular-nums',
+                  transition: 'all 0.12s',
+                }}
+                onMouseEnter={e => {
+                  (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.09)';
+                  (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.8)';
+                }}
+                onMouseLeave={e => {
+                  (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.04)';
+                  (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.42)';
+                }}
+              >{Math.round(zoom * 100)}%</button>
+              <button
+                onClick={() => changeZoom(ZOOM_STEP)}
+                disabled={zoom >= ZOOM_MAX}
+                title="Zoom in"
+                style={{
+                  width: 32, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  borderRadius: '0 7px 7px 0', border: '1px solid rgba(255,255,255,0.1)',
+                  background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 16,
+                  opacity: zoom >= ZOOM_MAX ? 0.3 : 1, transition: 'background 0.12s',
+                }}
+                onMouseEnter={e => { if (zoom < ZOOM_MAX) (e.currentTarget.style.background = 'rgba(255,255,255,0.09)'); }}
+                onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.04)')}
+              >+</button>
+            </div>
+          )}
+
+          {/* 2D / 3D segmented control */}
+          <div style={{
+            display: 'flex', alignItems: 'center',
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.09)',
+            borderRadius: 9, padding: 2,
+          }}>
+            <button
+              onClick={() => setView('2d')}
+              style={{
+                padding: '4px 15px', borderRadius: 7, border: 'none',
+                background: view === '2d' ? 'rgba(255,255,255,0.12)' : 'transparent',
+                color: view === '2d' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.35)',
+                cursor: 'pointer', fontSize: 13, fontWeight: 600,
+                transition: 'all 0.15s', whiteSpace: 'nowrap',
+                boxShadow: view === '2d' ? '0 1px 3px rgba(0,0,0,0.35)' : 'none',
+              }}
+            >2D</button>
+            <button
+              onClick={() => setView('3d')}
+              style={{
+                padding: '4px 15px', borderRadius: 7, border: 'none',
+                background: view === '3d' ? 'rgba(255,255,255,0.12)' : 'transparent',
+                color: view === '3d' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.35)',
+                cursor: 'pointer', fontSize: 13, fontWeight: 600,
+                transition: 'all 0.15s', whiteSpace: 'nowrap',
+                boxShadow: view === '3d' ? '0 1px 3px rgba(0,0,0,0.35)' : 'none',
+              }}
+            >3D</button>
+          </div>
+
+          {/* Logout */}
+          <button
+            onClick={handleLogout}
+            title=""
+            style={{
+              height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+              borderRadius: 8, border: '1px solid rgba(220,50,50,0.35)',
+              background: 'rgba(200,30,30,0.15)', color: 'rgba(255,100,100,0.85)',
+              cursor: 'pointer', fontSize: 12, fontWeight: 600, padding: '0 8px',
+              transition: 'all 0.12s', letterSpacing: '0.02em',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(200,30,30,0.28)'; e.currentTarget.style.color = '#ff6b6b'; e.currentTarget.style.borderColor = 'rgba(220,50,50,0.6)'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = 'rgba(200,30,30,0.15)'; e.currentTarget.style.color = 'rgba(255,100,100,0.85)'; e.currentTarget.style.borderColor = 'rgba(220,50,50,0.35)'; }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      {/* ── Stats bar ────────────────────────────────────────────── */}
+      <div style={{
+        borderBottom: '1px solid rgba(255,255,255,0.04)',
+        background: '#0a0a0d',
+        display: 'flex',
+        alignItems: 'center',
+        padding: '0 20px',
+        height: 40,
+        flexShrink: 0,
+        fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif',
+      }}>
+        {/* Module counts */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', flexShrink: 0, display: 'block' }} />
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Moduli</span>
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.length}</span>
+        </div>
+        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 12px' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#f97316', flexShrink: 0, display: 'block' }} />
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Konstrukcija</span>
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.filter(m => m.hasKonstrukcija).length}</span>
+        </div>
+        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 12px' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#3b82f6', flexShrink: 0, display: 'block' }} />
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Krov pun</span>
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.filter(m => m.hasKrovPun).length}</span>
+        </div>
+        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 12px' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#14b8a6', flexShrink: 0, display: 'block' }} />
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.38)', letterSpacing: '0.01em' }}>Stakleni krov</span>
+          <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.82)', fontWeight: 600, fontVariantNumeric: 'tabular-nums', minWidth: 12 }}>{modules.filter(m => m.hasStakleniKrov).length}</span>
+        </div>
+        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 22px' }} />
+        {/* Gabarit */}
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
+          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.07em', textTransform: 'uppercase' as const, fontWeight: 500 }}>Gabarit</span>
+          <span style={{
+            fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.01em',
+            color: bbox ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.18)',
+          }}>
+            {bbox ? `${bbox.w.toFixed(1)} × ${bbox.h.toFixed(1)} m` : '— × — m'}
+          </span>
+        </div>
+        <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 22px' }} />
+        {/* Površina */}
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
+          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.28)', letterSpacing: '0.07em', textTransform: 'uppercase' as const, fontWeight: 500 }}>Površina</span>
+          <span style={{
+            fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums',
+            color: totalArea > 0 ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.18)',
+          }}>
+            {totalArea > 0 ? `${totalArea.toFixed(2)} m²` : '—'}
+          </span>
+        </div>
+        {/* Screenshot dugme — vidljivo samo u 3D */}
+        {view === '3d' && (
+          <>
+            <div style={{ width: 1, height: 14, background: 'rgba(255,255,255,0.07)', margin: '0 22px' }} />
+            <button
+              onClick={() => { const r = (document.querySelector('canvas') as HTMLCanvasElement); if (!r) return; const a = document.createElement('a'); a.href = r.toDataURL('image/png'); a.download = `modular-${Date.now()}.png`; a.click(); }}
+              title="Snimi sliku"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 7, padding: '0 10px', height: 26, cursor: 'pointer',
+                color: 'rgba(255,255,255,0.7)', fontSize: 12, fontWeight: 600,
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+              Snimi
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* ── Grid area ─────────────────────────────────────────────── */}
+      {view === '2d' ? (
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-auto p-8"
+        onWheel={handleWheel}
+        style={{ cursor: drag ? 'grabbing' : 'default' }}
+      >
+        {/* Spacer so scrollbar tracks the zoomed size */}
+        <div style={{ width: cols * CELL * zoom, height: rows * CELL * zoom, position: 'relative', flexShrink: 0 }}>
+          {/* Actual grid — scaled from top-left */}
+          <div
+            ref={gridRef}
+            style={{
+              position:        'absolute',
+              top:             0,
+              left:            0,
+              transformOrigin: 'top left',
+              transform:       `scale(${zoom})`,
+              width:           cols * CELL,
+              height:          rows * CELL,
+              backgroundColor: '#0f0f12',
+              // Two dot layers: full-cell (bright) + half-cell (dim)
+              backgroundImage: [
+                `radial-gradient(circle, rgba(255,255,255,0.22) 1.5px, transparent 1.5px)`,
+                `radial-gradient(circle, rgba(255,255,255,0.07) 1px,   transparent 1px)`,
+              ].join(', '),
+              backgroundSize: [
+                `${CELL}px ${CELL}px`,
+                `${CELL / 2}px ${CELL / 2}px`,
+              ].join(', '),
+              backgroundPosition: [
+                `${CELL / 2}px ${CELL / 2}px`,
+                `${CELL / 4}px ${CELL / 4}px`,
+              ].join(', '),
+              borderRadius: 16,
+              border:       '1px solid rgba(255,255,255,0.05)',
+            }}
+          >
+          {/* ── Placed modules ── */}
+          {modules.map(m => {
+            const { w, h } = moduleSize(m);
+            const isBeingDragged = drag?.id === m.id;
+            
+            // Color scheme - različite boje za large i small module
+            const colors = m.type === 'large' ? {
+              bg: 'linear-gradient(135deg, rgba(34,197,94,0.2) 0%, rgba(74,222,128,0.2) 100%)',
+              border: 'rgba(34,197,94,0.4)',
+              shadow: 'rgba(34,197,94,0.25)',
+              arrow: 'rgba(34,197,94,0.6)',
+              btnBg: 'rgba(34,197,94,0.2)',
+              btnBorder: 'rgba(34,197,94,0.3)',
+              btnHover: 'rgba(34,197,94,0.35)',
+              text: 'rgba(134,239,172,0.95)',
+              textSub: 'rgba(134,239,172,0.8)',
+              label: (() => {
+                const activeCount = [
+                  m.hasKonstrukcija, m.hasStakleniKrov, m.hasFasada2PunZid, m.hasFasada1SaVratima,
+                  m.hasFasada1BezVrata, m.hasFasada4PodiznoKlizna, m.hasFasada4Fix, m.hasFasada4KupatiloProzor,
+                  m.hasFasada3ProzorSpavaca, m.hasFasada3PunZid, m.hasKrovPun, m.hasFasada4PunZid,
+                ].filter(Boolean).length;
+                return activeCount === 0 ? 'PRAZAN' : activeCount === 12 ? 'KOMPLETAN' : `${activeCount}/12`;
+              })()
+            } : m.type === 'medium' ? {
+              // Medium modul - narandzasta boja
+              bg: 'linear-gradient(135deg, rgba(249,115,22,0.2) 0%, rgba(251,146,60,0.2) 100%)',
+              border: 'rgba(249,115,22,0.4)',
+              shadow: 'rgba(249,115,22,0.25)',
+              arrow: 'rgba(249,115,22,0.6)',
+              btnBg: 'rgba(249,115,22,0.2)',
+              btnBorder: 'rgba(249,115,22,0.3)',
+              btnHover: 'rgba(249,115,22,0.35)',
+              text: 'rgba(253,186,116,0.95)',
+              textSub: 'rgba(253,186,116,0.8)',
+              label: (() => {
+                const activeCount = [
+                  m.hasKonstrukcija, m.hasStakleniKrov, m.hasFasada2PunZid, m.hasFasada3PunZid,
+                  m.hasFasada4PunZid, m.hasFasada4PodiznoKlizna, m.hasFasada4Fix, m.hasKrovPun,
+                  m.hasFasada1PodiznoKlizna, m.hasFasada1Fix, m.hasFasada2PodiznoKlizna, m.hasFasada2Fix,
+                  m.hasFasada3PodiznoKlizna, m.hasFasada3Fix, m.hasFasada1PunZid,
+                ].filter(Boolean).length;
+                return activeCount === 0 ? 'PRAZAN' : activeCount === 15 ? 'KOMPLETAN' : `${activeCount}/15`;
+              })()
+            } : {
+              // Small modul - plava boja
+              bg: 'linear-gradient(135deg, rgba(59,130,246,0.2) 0%, rgba(96,165,250,0.2) 100%)',
+              border: 'rgba(59,130,246,0.4)',
+              shadow: 'rgba(59,130,246,0.25)',
+              arrow: 'rgba(59,130,246,0.6)',
+              btnBg: 'rgba(59,130,246,0.2)',
+              btnBorder: 'rgba(59,130,246,0.3)',
+              btnHover: 'rgba(59,130,246,0.35)',
+              text: 'rgba(147,197,253,0.95)',
+              textSub: 'rgba(147,197,253,0.8)',
+              label: (() => {
+                const activeCount = [
+                  m.hasKonstrukcija, m.hasStakleniKrov, m.hasFasada2PunZid, m.hasFasada3PunZid,
+                  m.hasFasada4PunZid, m.hasFasada4PodiznoKlizna, m.hasFasada4Fix, m.hasKrovPun,
+                  m.hasFasada1PodiznoKlizna, m.hasFasada1Fix, m.hasFasada2PodiznoKlizna, m.hasFasada2Fix,
+                  m.hasFasada3PodiznoKlizna, m.hasFasada3Fix, m.hasFasada1PunZid,
+                ].filter(Boolean).length;
+                return activeCount === 0 ? 'PRAZAN' : activeCount === 15 ? 'KOMPLETAN' : `${activeCount}/15`;
+              })()
+            };
+
+            return (
+              <div
+                key={m.id}
+                onMouseDown={e => handleMouseDown(e, m.id)}
+                style={{
+                  position:   'absolute',
+                  left:       m.col * CELL,
+                  top:        m.row * CELL,
+                  width:      w * CELL,
+                  height:     h * CELL,
+                  padding:    6,
+                  zIndex:     isBeingDragged ? 0 : 2,
+                  opacity:    isBeingDragged ? 0.3 : 1,
+                  cursor:     drag ? 'grabbing' : 'grab',
+                  transition: isBeingDragged ? 'none' : 'opacity 0.12s',
+                }}
+              >
+                <div
+                  style={{
+                    width:         '100%',
+                    height:        '100%',
+                    borderRadius:  14,
+                    background:    colors.bg,
+                    border:        `2px solid ${colors.border}`,
+                    position:      'relative',
+                    overflow:      'hidden',
+                    boxShadow:     `0 4px 24px ${colors.shadow}`,
+                  }}
+                >
+                  {/* Rotation indicator - samo za large module */}
+                  {m.type === 'large' && (() => {
+                    const r = m.rotation;
+                    return (
+                      <>
+                        {r === 0 && <span style={{ position: 'absolute', pointerEvents: 'none', zIndex: 1, fontSize: 14, color: colors.arrow, left: 14, top: '50%', transform: 'translateY(-50%)' }}>→</span>}
+                        {r === 1 && <span style={{ position: 'absolute', pointerEvents: 'none', zIndex: 1, fontSize: 14, color: colors.arrow, top: 14, left: '50%', transform: 'translateX(-50%)' }}>↓</span>}
+                        {r === 2 && <span style={{ position: 'absolute', pointerEvents: 'none', zIndex: 1, fontSize: 14, color: colors.arrow, right: 14, top: '50%', transform: 'translateY(-50%)' }}>←</span>}
+                        {r === 3 && <span style={{ position: 'absolute', pointerEvents: 'none', zIndex: 1, fontSize: 14, color: colors.arrow, bottom: 14, left: '50%', transform: 'translateX(-50%)' }}>↑</span>}
+                      </>
+                    );
+                  })()}
+
+                  {/* Action buttons — top-right corner */}
+                  <div style={{
+                    position: 'absolute', top: 14, right: 14,
+                    display: 'flex', gap: 4, zIndex: 1,
+                  }}>
+                    {/* Rotate button - samo za large module */}
+                    {m.type === 'large' && (
+                      <button
+                        onMouseDown={e => e.stopPropagation()}
+                        onClick={e => { e.stopPropagation(); rotateModule(m.id); }}
+                        title="Rotiraj"
+                        style={{
+                          width: 22, height: 22, borderRadius: '50%',
+                          background: colors.btnBg,
+                          border: `1px solid ${colors.btnBorder}`, cursor: 'pointer', color: colors.text,
+                          fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          transition: 'background 0.15s', flexShrink: 0,
+                        }}
+                        onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnHover)}
+                        onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnBg)}
+                      >↻</button>
+                    )}
+                    <button
+                      onMouseDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); openOptionsModal(m.id); }}
+                      title="Opcije modula"
+                      style={{
+                        width: 22, height: 22, borderRadius: '50%',
+                        background: colors.btnBg,
+                        border: `1px solid ${colors.btnBorder}`, cursor: 'pointer', color: colors.text,
+                        fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        transition: 'background 0.15s', flexShrink: 0,
+                      }}
+                      onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnHover)}
+                      onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnBg)}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
+                        <circle cx="12" cy="12" r="3"/>
+                      </svg>
+                    </button>
+                    <button
+                      onMouseDown={e => e.stopPropagation()}
+                      onClick={e => { e.stopPropagation(); removeModule(m.id); }}
+                      title="Ukloni"
+                      style={{
+                        width: 22, height: 22, borderRadius: '50%',
+                        background: colors.btnBg,
+                        border: `1px solid ${colors.btnBorder}`, cursor: 'pointer', color: colors.text,
+                        fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        transition: 'background 0.15s', flexShrink: 0,
+                      }}
+                      onMouseEnter={e => ((e.currentTarget as HTMLButtonElement).style.background = 'rgba(239,68,68,0.5)')}
+                      onMouseLeave={e => ((e.currentTarget as HTMLButtonElement).style.background = colors.btnBg)}
+                    >✕</button>
+                  </div>
+
+                  {/* Label — bottom-left */}
+                  {(w * CELL > 40 && h * CELL > 40) && (
+                    <div style={{ position: 'absolute', bottom: 14, left: 14 }}>
+                      <p style={{ fontSize: Math.min(18, w * CELL * 0.11), fontWeight: 800, lineHeight: 1, margin: 0, color: colors.text }}>
+                        {colors.label}
+                      </p>
+                      <p style={{ fontSize: 10, opacity: 0.6, margin: '3px 0 0', whiteSpace: 'nowrap', color: colors.textSub }}>
+                        {m.rotation % 2 !== 0 ? '2.4 × 4.8 m' : '4.8 × 2.4 m'}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* ── Drag ghost ── */}
+          {drag && draggingModule && (
+            <div
+              style={{
+                position:     'absolute',
+                left:         drag.ghostCol * CELL,
+                top:          drag.ghostRow  * CELL,
+                width:        moduleSize(draggingModule).w * CELL,
+                height:       moduleSize(draggingModule).h * CELL,
+                padding:      6,
+                pointerEvents:'none',
+                zIndex:       20,
+              }}
+            >
+              <div
+                style={{
+                  width:        '100%',
+                  height:       '100%',
+                  borderRadius: 16,
+                  border:       `2px dashed ${ghostValid ? 'rgba(255,255,255,0.5)' : 'rgba(239,68,68,0.7)'}`,
+                  background:   ghostValid ? 'rgba(255,255,255,0.06)' : 'rgba(239,68,68,0.08)',
+                  transition:   'border-color 0.1s, background 0.1s',
+                }}
+              />
+            </div>
+          )}
+          </div>{/* end: scaled grid */}
+        </div>{/* end: spacer */}
+
+        {/* Legend */}
+        <p style={{ marginTop: 16, fontSize: 11, color: '#374151' }}>
+          Klikni i prevuci modul da ga pomeriš &nbsp;·&nbsp; ↻ rotiraj veliki modul &nbsp;·&nbsp; ✕ ukloni &nbsp;·&nbsp; Ctrl + scroll za zoom
+        </p>
+      </div>
+      ) : (
+      <div style={{ position: 'relative', height: 'calc(100vh - 56px)' }}>
+        <Scene3D modules={modules} cols={cols} rows={rows} />
+        {modules.length === 0 && (
+          <div style={{
+            position: 'absolute', inset: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            pointerEvents: 'none',
+          }}>
+            <p style={{ color: 'rgba(255,255,255,0.2)', fontSize: 15 }}>
+              Nema modula — dodaj ih u 2D prikazu
+            </p>
+          </div>
+        )}
+      </div>
+      )}
+
+      {/* ── Module Options Modal ──────────────────────────────────── */}
+      {optionsModalOpen && editingModuleId && (() => {
+        const editingModule = modules.find(m => m.id === editingModuleId);
+        if (!editingModule) return null;
+        
+        const activeCount = (editingModule.type === 'medium' || editingModule.type === 'small') ? [
+          editingModule.hasKonstrukcija, editingModule.hasStakleniKrov, editingModule.hasFasada2PunZid,
+          editingModule.hasFasada3PunZid, editingModule.hasFasada4PunZid, editingModule.hasFasada4PodiznoKlizna,
+          editingModule.hasFasada4Fix, editingModule.hasKrovPun,
+          editingModule.hasFasada1PodiznoKlizna, editingModule.hasFasada1Fix,
+          editingModule.hasFasada2PodiznoKlizna, editingModule.hasFasada2Fix,
+          editingModule.hasFasada3PodiznoKlizna, editingModule.hasFasada3Fix, editingModule.hasFasada1PunZid,
+        ].filter(Boolean).length : [
+          editingModule.hasKonstrukcija, editingModule.hasStakleniKrov, editingModule.hasFasada2PunZid, 
+          editingModule.hasFasada1SaVratima, editingModule.hasFasada1BezVrata, editingModule.hasFasada4PodiznoKlizna, 
+          editingModule.hasFasada4Fix, editingModule.hasFasada4KupatiloProzor, editingModule.hasFasada3ProzorSpavaca, 
+          editingModule.hasFasada3PunZid, editingModule.hasKrovPun, editingModule.hasFasada4PunZid,
+        ].filter(Boolean).length;
+        const maxCount = editingModule.type === 'large' ? 12 : (editingModule.type === 'medium' || editingModule.type === 'small') ? 15 : 0;
+        
+        return (
+          <div
+            style={{
+              position: 'fixed', inset: 0, zIndex: 1000,
+              background: 'rgba(0,0,0,0.88)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              backdropFilter: 'blur(12px)',
+            }}
+            onClick={(e) => { if (e.target === e.currentTarget) setOptionsModalOpen(false); }}
+          >
+            <div style={{
+              background: 'linear-gradient(135deg, rgba(17,17,24,0.98) 0%, rgba(24,24,36,0.98) 100%)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              borderRadius: 20, 
+              width: '92vw', 
+              maxWidth: 520,
+              maxHeight: '90vh',
+              display: 'flex', 
+              flexDirection: 'column',
+              fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.03)',
+              overflow: 'hidden',
+            }}>
+              {/* Header */}
+              <div style={{ 
+                padding: '24px 28px 20px', 
+                borderBottom: '1px solid rgba(255,255,255,0.06)',
+                background: 'linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%)',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: '#fff', letterSpacing: '-0.02em' }}>
+                      Komponente modula
+                    </h2>
+                    <p style={{ margin: '6px 0 0', fontSize: 13, color: 'rgba(255,255,255,0.45)', fontWeight: 400 }}>
+                      Prilagodi svoj modularni objekat
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setOptionsModalOpen(false)}
+                    style={{ 
+                      background: 'rgba(255,255,255,0.05)', 
+                      border: '1px solid rgba(255,255,255,0.08)',
+                      borderRadius: 8,
+                      width: 32,
+                      height: 32,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      cursor: 'pointer', 
+                      color: 'rgba(255,255,255,0.5)', 
+                      fontSize: 18, 
+                      lineHeight: 1,
+                      transition: 'all 0.2s',
+                    }}
+                    onMouseEnter={e => {
+                      (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.1)';
+                      (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.8)';
+                    }}
+                    onMouseLeave={e => {
+                      (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.05)';
+                      (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.5)';
+                    }}
+                  >×</button>
+                </div>
+                <div style={{ 
+                  display: 'inline-flex', 
+                  alignItems: 'center', 
+                  gap: 8,
+                  padding: '6px 12px',
+                  background: activeCount === maxCount 
+                    ? 'linear-gradient(135deg, rgba(34,197,94,0.15), rgba(16,185,129,0.15))' 
+                    : 'rgba(255,255,255,0.04)',
+                  border: activeCount === maxCount 
+                    ? '1px solid rgba(34,197,94,0.3)' 
+                    : '1px solid rgba(255,255,255,0.08)',
+                  borderRadius: 8,
+                }}>
+                  <div style={{ 
+                    fontSize: 18, 
+                    fontWeight: 700, 
+                    color: activeCount === maxCount ? '#22c55e' : '#fff',
+                    letterSpacing: '-0.01em',
+                  }}>
+                    {activeCount}
+                  </div>
+                  <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)', fontWeight: 500 }}>
+                    / {maxCount} aktivno
+                  </div>
+                </div>
+              </div>
+
+              {/* Scrollable Content */}
+              <div style={{ 
+                flex: 1,
+                overflowY: 'auto',
+                padding: '20px 28px 24px',
+                display: 'flex', 
+                flexDirection: 'column', 
+                gap: 24,
+              }}
+              className="custom-scrollbar"
+              >
+                
+                {/* KONSTRUKCIJA */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.5, marginBottom: 12, textTransform: 'uppercase' }}>KONSTRUKCIJA</div>
+                  <button
+                    onClick={() => toggleKonstrukcija(editingModuleId)}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 14,
+                      background: editingModule.hasKonstrukcija 
+                        ? 'linear-gradient(135deg, rgba(249,115,22,0.15) 0%, rgba(249,115,22,0.08) 100%)' 
+                        : 'rgba(255,255,255,0.03)',
+                      border: editingModule.hasKonstrukcija ? '2px solid rgba(249,115,22,0.5)' : '2px solid rgba(255,255,255,0.08)',
+                      borderRadius: 14, padding: '14px 16px',
+                      cursor: 'pointer', textAlign: 'left',
+                      transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                      boxShadow: editingModule.hasKonstrukcija 
+                        ? '0 0 24px rgba(249,115,22,0.15), 0 4px 12px rgba(0,0,0,0.15)' 
+                        : '0 2px 8px rgba(0,0,0,0.08)',
+                    }}
+                    onMouseEnter={e => {
+                      (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasKonstrukcija 
+                        ? 'linear-gradient(135deg, rgba(249,115,22,0.2) 0%, rgba(249,115,22,0.12) 100%)' 
+                        : 'rgba(255,255,255,0.06)';
+                      (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasKonstrukcija ? 'rgba(249,115,22,0.65)' : 'rgba(255,255,255,0.15)';
+                      (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.01) translateY(-1px)';
+                      (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasKonstrukcija 
+                        ? '0 0 32px rgba(249,115,22,0.25), 0 6px 16px rgba(0,0,0,0.2)' 
+                        : '0 4px 12px rgba(0,0,0,0.12)';
+                    }}
+                    onMouseLeave={e => {
+                      (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasKonstrukcija 
+                        ? 'linear-gradient(135deg, rgba(249,115,22,0.15) 0%, rgba(249,115,22,0.08) 100%)' 
+                        : 'rgba(255,255,255,0.03)';
+                      (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasKonstrukcija ? 'rgba(249,115,22,0.5)' : 'rgba(255,255,255,0.08)';
+                      (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                      (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasKonstrukcija 
+                        ? '0 0 24px rgba(249,115,22,0.15), 0 4px 12px rgba(0,0,0,0.15)' 
+                        : '0 2px 8px rgba(0,0,0,0.08)';
+                    }}
+                  >
+                    <div style={{
+                      width: 44, height: 24, borderRadius: 12,
+                      background: editingModule.hasKonstrukcija 
+                        ? 'linear-gradient(135deg, rgba(249,115,22,0.95) 0%, rgba(234,88,12,0.95) 100%)' 
+                        : 'rgba(255,255,255,0.08)',
+                      position: 'relative', flexShrink: 0,
+                      transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                      boxShadow: editingModule.hasKonstrukcija ? '0 2px 8px rgba(249,115,22,0.3)' : 'none',
+                    }}>
+                      <div style={{
+                        width: 18, height: 18, borderRadius: '50%',
+                        background: '#fff',
+                        position: 'absolute', top: 3,
+                        left: editingModule.hasKonstrukcija ? 23 : 3,
+                        transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+                      }} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.95)', marginBottom: 2 }}>Konstrukcija</div>
+                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>Konstruktivni elementi</div>
+                    </div>
+                    {editingModule.hasKonstrukcija && (
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(249,115,22,0.95)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 4px rgba(249,115,22,0.4))' }}>
+                        <polyline points="20 6 9 17 4 12"/>
+                      </svg>
+                    )}
+                  </button>
+                </div>
+
+                {/* KROVOVI */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.5, marginBottom: 12, textTransform: 'uppercase' }}>KROVOVI</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <button
+                      onClick={() => toggleKrovPun(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 14,
+                        background: editingModule.hasKrovPun 
+                          ? 'linear-gradient(135deg, rgba(59,130,246,0.15) 0%, rgba(59,130,246,0.08) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasKrovPun ? '2px solid rgba(59,130,246,0.5)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 14, padding: '14px 16px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasKrovPun 
+                          ? '0 0 24px rgba(59,130,246,0.15), 0 4px 12px rgba(0,0,0,0.15)' 
+                          : '0 2px 8px rgba(0,0,0,0.08)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasKrovPun 
+                          ? 'linear-gradient(135deg, rgba(59,130,246,0.2) 0%, rgba(59,130,246,0.12) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasKrovPun ? 'rgba(59,130,246,0.65)' : 'rgba(255,255,255,0.15)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.01) translateY(-1px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasKrovPun 
+                          ? '0 0 32px rgba(59,130,246,0.25), 0 6px 16px rgba(0,0,0,0.2)' 
+                          : '0 4px 12px rgba(0,0,0,0.12)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasKrovPun 
+                          ? 'linear-gradient(135deg, rgba(59,130,246,0.15) 0%, rgba(59,130,246,0.08) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasKrovPun ? 'rgba(59,130,246,0.5)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasKrovPun 
+                          ? '0 0 24px rgba(59,130,246,0.15), 0 4px 12px rgba(0,0,0,0.15)' 
+                          : '0 2px 8px rgba(0,0,0,0.08)';
+                      }}
+                    >
+                      <div style={{
+                        width: 44, height: 24, borderRadius: 12,
+                        background: editingModule.hasKrovPun 
+                          ? 'linear-gradient(135deg, rgba(59,130,246,0.95) 0%, rgba(37,99,235,0.95) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasKrovPun ? '0 2px 8px rgba(59,130,246,0.3)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 18, height: 18, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasKrovPun ? 23 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.95)', marginBottom: 2 }}>Puni krov</div>
+                        <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>Standardni krov</div>
+                      </div>
+                      {editingModule.hasKrovPun && (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(59,130,246,0.95)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 4px rgba(59,130,246,0.4))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={() => toggleStakleniKrov(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 14,
+                        background: editingModule.hasStakleniKrov 
+                          ? 'linear-gradient(135deg, rgba(20,184,166,0.15) 0%, rgba(20,184,166,0.08) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasStakleniKrov ? '2px solid rgba(20,184,166,0.5)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 14, padding: '14px 16px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasStakleniKrov 
+                          ? '0 0 24px rgba(20,184,166,0.15), 0 4px 12px rgba(0,0,0,0.15)' 
+                          : '0 2px 8px rgba(0,0,0,0.08)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasStakleniKrov 
+                          ? 'linear-gradient(135deg, rgba(20,184,166,0.2) 0%, rgba(20,184,166,0.12) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasStakleniKrov ? 'rgba(20,184,166,0.65)' : 'rgba(255,255,255,0.15)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.01) translateY(-1px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasStakleniKrov 
+                          ? '0 0 32px rgba(20,184,166,0.25), 0 6px 16px rgba(0,0,0,0.2)' 
+                          : '0 4px 12px rgba(0,0,0,0.12)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasStakleniKrov 
+                          ? 'linear-gradient(135deg, rgba(20,184,166,0.15) 0%, rgba(20,184,166,0.08) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasStakleniKrov ? 'rgba(20,184,166,0.5)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasStakleniKrov 
+                          ? '0 0 24px rgba(20,184,166,0.15), 0 4px 12px rgba(0,0,0,0.15)' 
+                          : '0 2px 8px rgba(0,0,0,0.08)';
+                      }}
+                    >
+                      <div style={{
+                        width: 44, height: 24, borderRadius: 12,
+                        background: editingModule.hasStakleniKrov 
+                          ? 'linear-gradient(135deg, rgba(20,184,166,0.95) 0%, rgba(13,148,136,0.95) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasStakleniKrov ? '0 2px 8px rgba(20,184,166,0.3)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 18, height: 18, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasStakleniKrov ? 23 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: 'rgba(255,255,255,0.95)', marginBottom: 2 }}>Stakleni krov</div>
+                        <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)' }}>Krov sa staklom</div>
+                      </div>
+                      {editingModule.hasStakleniKrov && (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="rgba(20,184,166,0.95)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 4px rgba(20,184,166,0.4))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* FASADE */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.5, marginBottom: 12, textTransform: 'uppercase' }}>FASADE</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+                    <button
+                      onClick={() => toggleFasada2PunZid(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada2PunZid 
+                          ? 'linear-gradient(135deg, rgba(34,197,94,0.14) 0%, rgba(34,197,94,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada2PunZid ? '2px solid rgba(34,197,94,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada2PunZid 
+                          ? '0 0 20px rgba(34,197,94,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada2PunZid 
+                          ? 'linear-gradient(135deg, rgba(34,197,94,0.18) 0%, rgba(34,197,94,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada2PunZid ? 'rgba(34,197,94,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada2PunZid 
+                          ? '0 0 28px rgba(34,197,94,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada2PunZid 
+                          ? 'linear-gradient(135deg, rgba(34,197,94,0.14) 0%, rgba(34,197,94,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada2PunZid ? 'rgba(34,197,94,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada2PunZid 
+                          ? '0 0 20px rgba(34,197,94,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada2PunZid 
+                          ? 'linear-gradient(135deg, rgba(34,197,94,0.92) 0%, rgba(22,163,74,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada2PunZid ? '0 2px 6px rgba(34,197,94,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada2PunZid ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 2 - Puni zid</div>
+                      {editingModule.hasFasada2PunZid && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(34,197,94,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(34,197,94,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    {editingModule.type === 'large' && (<>
+                    <button
+                      onClick={() => toggleFasada1SaVratima(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada1SaVratima 
+                          ? 'linear-gradient(135deg, rgba(168,85,247,0.14) 0%, rgba(168,85,247,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada1SaVratima ? '2px solid rgba(168,85,247,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada1SaVratima 
+                          ? '0 0 20px rgba(168,85,247,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada1SaVratima 
+                          ? 'linear-gradient(135deg, rgba(168,85,247,0.18) 0%, rgba(168,85,247,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada1SaVratima ? 'rgba(168,85,247,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada1SaVratima 
+                          ? '0 0 28px rgba(168,85,247,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada1SaVratima 
+                          ? 'linear-gradient(135deg, rgba(168,85,247,0.14) 0%, rgba(168,85,247,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada1SaVratima ? 'rgba(168,85,247,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada1SaVratima 
+                          ? '0 0 20px rgba(168,85,247,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada1SaVratima 
+                          ? 'linear-gradient(135deg, rgba(168,85,247,0.92) 0%, rgba(147,2,234,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada1SaVratima ? '0 2px 6px rgba(168,85,247,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada1SaVratima ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 1 - Sa vratima</div>
+                      {editingModule.hasFasada1SaVratima && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(168,85,247,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(168,85,247,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={() => toggleFasada1BezVrata(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada1BezVrata 
+                          ? 'linear-gradient(135deg, rgba(236,72,153,0.14) 0%, rgba(236,72,153,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada1BezVrata ? '2px solid rgba(236,72,153,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada1BezVrata 
+                          ? '0 0 20px rgba(236,72,153,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada1BezVrata 
+                          ? 'linear-gradient(135deg, rgba(236,72,153,0.18) 0%, rgba(236,72,153,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada1BezVrata ? 'rgba(236,72,153,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada1BezVrata 
+                          ? '0 0 28px rgba(236,72,153,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada1BezVrata 
+                          ? 'linear-gradient(135deg, rgba(236,72,153,0.14) 0%, rgba(236,72,153,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada1BezVrata ? 'rgba(236,72,153,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada1BezVrata 
+                          ? '0 0 20px rgba(236,72,153,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada1BezVrata 
+                          ? 'linear-gradient(135deg, rgba(236,72,153,0.92) 0%, rgba(219,39,119,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada1BezVrata ? '0 2px 6px rgba(236,72,153,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada1BezVrata ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 1 - Bez vrata</div>
+                      {editingModule.hasFasada1BezVrata && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(236,72,153,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(236,72,153,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+                    </>)}
+
+                    <button
+                      onClick={() => toggleFasada4PodiznoKlizna(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada4PodiznoKlizna 
+                          ? 'linear-gradient(135deg, rgba(245,158,11,0.14) 0%, rgba(245,158,11,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada4PodiznoKlizna ? '2px solid rgba(245,158,11,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4PodiznoKlizna 
+                          ? '0 0 20px rgba(245,158,11,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4PodiznoKlizna 
+                          ? 'linear-gradient(135deg, rgba(245,158,11,0.18) 0%, rgba(245,158,11,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4PodiznoKlizna ? 'rgba(245,158,11,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4PodiznoKlizna 
+                          ? '0 0 28px rgba(245,158,11,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4PodiznoKlizna 
+                          ? 'linear-gradient(135deg, rgba(245,158,11,0.14) 0%, rgba(245,158,11,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4PodiznoKlizna ? 'rgba(245,158,11,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4PodiznoKlizna 
+                          ? '0 0 20px rgba(245,158,11,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada4PodiznoKlizna 
+                          ? 'linear-gradient(135deg, rgba(245,158,11,0.92) 0%, rgba(217,119,6,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4PodiznoKlizna ? '0 2px 6px rgba(245,158,11,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada4PodiznoKlizna ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 4 - Podizno klizna</div>
+                      {editingModule.hasFasada4PodiznoKlizna && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(245,158,11,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(245,158,11,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={() => toggleFasada4Fix(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada4Fix 
+                          ? 'linear-gradient(135deg, rgba(99,102,241,0.14) 0%, rgba(99,102,241,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada4Fix ? '2px solid rgba(99,102,241,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4Fix 
+                          ? '0 0 20px rgba(99,102,241,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4Fix 
+                          ? 'linear-gradient(135deg, rgba(99,102,241,0.18) 0%, rgba(99,102,241,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4Fix ? 'rgba(99,102,241,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4Fix 
+                          ? '0 0 28px rgba(99,102,241,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4Fix 
+                          ? 'linear-gradient(135deg, rgba(99,102,241,0.14) 0%, rgba(99,102,241,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4Fix ? 'rgba(99,102,241,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4Fix 
+                          ? '0 0 20px rgba(99,102,241,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada4Fix 
+                          ? 'linear-gradient(135deg, rgba(99,102,241,0.92) 0%, rgba(79,70,229,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4Fix ? '0 2px 6px rgba(99,102,241,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada4Fix ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 4 - Fiksna</div>
+                      {editingModule.hasFasada4Fix && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(99,102,241,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(99,102,241,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    {editingModule.type === 'large' && (<>
+                    <button
+                      onClick={() => toggleFasada4KupatiloProzor(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada4KupatiloProzor 
+                          ? 'linear-gradient(135deg, rgba(6,182,212,0.14) 0%, rgba(6,182,212,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada4KupatiloProzor ? '2px solid rgba(6,182,212,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4KupatiloProzor 
+                          ? '0 0 20px rgba(6,182,212,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4KupatiloProzor 
+                          ? 'linear-gradient(135deg, rgba(6,182,212,0.18) 0%, rgba(6,182,212,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4KupatiloProzor ? 'rgba(6,182,212,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4KupatiloProzor 
+                          ? '0 0 28px rgba(6,182,212,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4KupatiloProzor 
+                          ? 'linear-gradient(135deg, rgba(6,182,212,0.14) 0%, rgba(6,182,212,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4KupatiloProzor ? 'rgba(6,182,212,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4KupatiloProzor 
+                          ? '0 0 20px rgba(6,182,212,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada4KupatiloProzor 
+                          ? 'linear-gradient(135deg, rgba(6,182,212,0.92) 0%, rgba(8,145,178,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4KupatiloProzor ? '0 2px 6px rgba(6,182,212,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada4KupatiloProzor ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 4 - Kupatilo</div>
+                      {editingModule.hasFasada4KupatiloProzor && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(6,182,212,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(6,182,212,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={() => toggleFasada3ProzorSpavaca(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada3ProzorSpavaca 
+                          ? 'linear-gradient(135deg, rgba(244,63,94,0.14) 0%, rgba(244,63,94,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada3ProzorSpavaca ? '2px solid rgba(244,63,94,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada3ProzorSpavaca 
+                          ? '0 0 20px rgba(244,63,94,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada3ProzorSpavaca 
+                          ? 'linear-gradient(135deg, rgba(244,63,94,0.18) 0%, rgba(244,63,94,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada3ProzorSpavaca ? 'rgba(244,63,94,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada3ProzorSpavaca 
+                          ? '0 0 28px rgba(244,63,94,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada3ProzorSpavaca 
+                          ? 'linear-gradient(135deg, rgba(244,63,94,0.14) 0%, rgba(244,63,94,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada3ProzorSpavaca ? 'rgba(244,63,94,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada3ProzorSpavaca 
+                          ? '0 0 20px rgba(244,63,94,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada3ProzorSpavaca 
+                          ? 'linear-gradient(135deg, rgba(244,63,94,0.92) 0%, rgba(225,29,72,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada3ProzorSpavaca ? '0 2px 6px rgba(244,63,94,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada3ProzorSpavaca ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 3 - Spavaća soba</div>
+                      {editingModule.hasFasada3ProzorSpavaca && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(244,63,94,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(244,63,94,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+                    </>)}
+
+                    <button
+                      onClick={() => toggleFasada3PunZid(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada3PunZid 
+                          ? 'linear-gradient(135deg, rgba(132,204,22,0.14) 0%, rgba(132,204,22,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada3PunZid ? '2px solid rgba(132,204,22,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada3PunZid 
+                          ? '0 0 20px rgba(132,204,22,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada3PunZid 
+                          ? 'linear-gradient(135deg, rgba(132,204,22,0.18) 0%, rgba(132,204,22,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada3PunZid ? 'rgba(132,204,22,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada3PunZid 
+                          ? '0 0 28px rgba(132,204,22,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada3PunZid 
+                          ? 'linear-gradient(135deg, rgba(132,204,22,0.14) 0%, rgba(132,204,22,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada3PunZid ? 'rgba(132,204,22,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada3PunZid 
+                          ? '0 0 20px rgba(132,204,22,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada3PunZid 
+                          ? 'linear-gradient(135deg, rgba(132,204,22,0.92) 0%, rgba(101,163,13,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada3PunZid ? '0 2px 6px rgba(132,204,22,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada3PunZid ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 3 - Puni zid</div>
+                      {editingModule.hasFasada3PunZid && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(132,204,22,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(132,204,22,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={() => toggleFasada4PunZid(editingModuleId)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        background: editingModule.hasFasada4PunZid 
+                          ? 'linear-gradient(135deg, rgba(147,51,234,0.14) 0%, rgba(147,51,234,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)',
+                        border: editingModule.hasFasada4PunZid ? '2px solid rgba(147,51,234,0.48)' : '2px solid rgba(255,255,255,0.08)',
+                        borderRadius: 13, padding: '11px 14px',
+                        cursor: 'pointer', textAlign: 'left',
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4PunZid 
+                          ? '0 0 20px rgba(147,51,234,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)',
+                      }}
+                      onMouseEnter={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4PunZid 
+                          ? 'linear-gradient(135deg, rgba(147,51,234,0.18) 0%, rgba(147,51,234,0.10) 100%)' 
+                          : 'rgba(255,255,255,0.06)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4PunZid ? 'rgba(147,51,234,0.6)' : 'rgba(255,255,255,0.14)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1.008) translateY(-0.5px)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4PunZid 
+                          ? '0 0 28px rgba(147,51,234,0.2), 0 5px 14px rgba(0,0,0,0.16)' 
+                          : '0 3px 10px rgba(0,0,0,0.10)';
+                      }}
+                      onMouseLeave={e => {
+                        (e.currentTarget as HTMLButtonElement).style.background = editingModule.hasFasada4PunZid 
+                          ? 'linear-gradient(135deg, rgba(147,51,234,0.14) 0%, rgba(147,51,234,0.07) 100%)' 
+                          : 'rgba(255,255,255,0.03)';
+                        (e.currentTarget as HTMLButtonElement).style.borderColor = editingModule.hasFasada4PunZid ? 'rgba(147,51,234,0.48)' : 'rgba(255,255,255,0.08)';
+                        (e.currentTarget as HTMLButtonElement).style.transform = 'scale(1) translateY(0)';
+                        (e.currentTarget as HTMLButtonElement).style.boxShadow = editingModule.hasFasada4PunZid 
+                          ? '0 0 20px rgba(147,51,234,0.12), 0 3px 10px rgba(0,0,0,0.12)' 
+                          : '0 2px 6px rgba(0,0,0,0.06)';
+                      }}
+                    >
+                      <div style={{
+                        width: 40, height: 22, borderRadius: 11,
+                        background: editingModule.hasFasada4PunZid 
+                          ? 'linear-gradient(135deg, rgba(147,51,234,0.92) 0%, rgba(126,34,206,0.92) 100%)' 
+                          : 'rgba(255,255,255,0.08)',
+                        position: 'relative', flexShrink: 0,
+                        transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                        boxShadow: editingModule.hasFasada4PunZid ? '0 2px 6px rgba(147,51,234,0.25)' : 'none',
+                      }}>
+                        <div style={{
+                          width: 16, height: 16, borderRadius: '50%',
+                          background: '#fff',
+                          position: 'absolute', top: 3,
+                          left: editingModule.hasFasada4PunZid ? 21 : 3,
+                          transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                          boxShadow: '0 2px 5px rgba(0,0,0,0.25)',
+                        }} />
+                      </div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 4 - Puni zid</div>
+                      {editingModule.hasFasada4PunZid && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(147,51,234,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ filter: 'drop-shadow(0 0 3px rgba(147,51,234,0.35))' }}>
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      )}
+                    </button>
+
+                    {(editingModule.type === 'medium' || editingModule.type === 'small') && (<>
+                    <button onClick={() => toggleFasada1PunZid(editingModuleId)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: editingModule.hasFasada1PunZid ? 'linear-gradient(135deg, rgba(249,115,22,0.14) 0%, rgba(249,115,22,0.07) 100%)' : 'rgba(255,255,255,0.03)', border: editingModule.hasFasada1PunZid ? '2px solid rgba(249,115,22,0.48)' : '2px solid rgba(255,255,255,0.08)', borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada1PunZid ? '0 0 20px rgba(249,115,22,0.12), 0 3px 10px rgba(0,0,0,0.12)' : '0 2px 6px rgba(0,0,0,0.06)' }}>
+                      <div style={{ width: 40, height: 22, borderRadius: 11, background: editingModule.hasFasada1PunZid ? 'linear-gradient(135deg, rgba(249,115,22,0.92) 0%, rgba(234,88,12,0.92) 100%)' : 'rgba(255,255,255,0.08)', position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada1PunZid ? '0 2px 6px rgba(249,115,22,0.25)' : 'none' }}><div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff', position: 'absolute', top: 3, left: editingModule.hasFasada1PunZid ? 21 : 3, transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)' }} /></div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 1 - Puni zid</div>
+                      {editingModule.hasFasada1PunZid && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(249,115,22,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
+                    </button>
+
+                    <button onClick={() => toggleFasada1PodiznoKlizna(editingModuleId)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: editingModule.hasFasada1PodiznoKlizna ? 'linear-gradient(135deg, rgba(20,184,166,0.14) 0%, rgba(20,184,166,0.07) 100%)' : 'rgba(255,255,255,0.03)', border: editingModule.hasFasada1PodiznoKlizna ? '2px solid rgba(20,184,166,0.48)' : '2px solid rgba(255,255,255,0.08)', borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada1PodiznoKlizna ? '0 0 20px rgba(20,184,166,0.12), 0 3px 10px rgba(0,0,0,0.12)' : '0 2px 6px rgba(0,0,0,0.06)' }}>
+                      <div style={{ width: 40, height: 22, borderRadius: 11, background: editingModule.hasFasada1PodiznoKlizna ? 'linear-gradient(135deg, rgba(20,184,166,0.92) 0%, rgba(13,148,136,0.92) 100%)' : 'rgba(255,255,255,0.08)', position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada1PodiznoKlizna ? '0 2px 6px rgba(20,184,166,0.25)' : 'none' }}><div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff', position: 'absolute', top: 3, left: editingModule.hasFasada1PodiznoKlizna ? 21 : 3, transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)' }} /></div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 1 - Podizno klizna</div>
+                      {editingModule.hasFasada1PodiznoKlizna && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(20,184,166,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
+                    </button>
+
+                    <button onClick={() => toggleFasada1Fix(editingModuleId)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: editingModule.hasFasada1Fix ? 'linear-gradient(135deg, rgba(14,165,233,0.14) 0%, rgba(14,165,233,0.07) 100%)' : 'rgba(255,255,255,0.03)', border: editingModule.hasFasada1Fix ? '2px solid rgba(14,165,233,0.48)' : '2px solid rgba(255,255,255,0.08)', borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada1Fix ? '0 0 20px rgba(14,165,233,0.12), 0 3px 10px rgba(0,0,0,0.12)' : '0 2px 6px rgba(0,0,0,0.06)' }}>
+                      <div style={{ width: 40, height: 22, borderRadius: 11, background: editingModule.hasFasada1Fix ? 'linear-gradient(135deg, rgba(14,165,233,0.92) 0%, rgba(2,132,199,0.92) 100%)' : 'rgba(255,255,255,0.08)', position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada1Fix ? '0 2px 6px rgba(14,165,233,0.25)' : 'none' }}><div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff', position: 'absolute', top: 3, left: editingModule.hasFasada1Fix ? 21 : 3, transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)' }} /></div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 1 - Fiksna</div>
+                      {editingModule.hasFasada1Fix && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(14,165,233,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
+                    </button>
+
+                    <button onClick={() => toggleFasada2PodiznoKlizna(editingModuleId)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: editingModule.hasFasada2PodiznoKlizna ? 'linear-gradient(135deg, rgba(217,70,239,0.14) 0%, rgba(217,70,239,0.07) 100%)' : 'rgba(255,255,255,0.03)', border: editingModule.hasFasada2PodiznoKlizna ? '2px solid rgba(217,70,239,0.48)' : '2px solid rgba(255,255,255,0.08)', borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada2PodiznoKlizna ? '0 0 20px rgba(217,70,239,0.12), 0 3px 10px rgba(0,0,0,0.12)' : '0 2px 6px rgba(0,0,0,0.06)' }}>
+                      <div style={{ width: 40, height: 22, borderRadius: 11, background: editingModule.hasFasada2PodiznoKlizna ? 'linear-gradient(135deg, rgba(217,70,239,0.92) 0%, rgba(192,38,211,0.92) 100%)' : 'rgba(255,255,255,0.08)', position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada2PodiznoKlizna ? '0 2px 6px rgba(217,70,239,0.25)' : 'none' }}><div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff', position: 'absolute', top: 3, left: editingModule.hasFasada2PodiznoKlizna ? 21 : 3, transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)' }} /></div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 2 - Podizno klizna</div>
+                      {editingModule.hasFasada2PodiznoKlizna && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(217,70,239,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
+                    </button>
+
+                    <button onClick={() => toggleFasada2Fix(editingModuleId)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: editingModule.hasFasada2Fix ? 'linear-gradient(135deg, rgba(16,185,129,0.14) 0%, rgba(16,185,129,0.07) 100%)' : 'rgba(255,255,255,0.03)', border: editingModule.hasFasada2Fix ? '2px solid rgba(16,185,129,0.48)' : '2px solid rgba(255,255,255,0.08)', borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada2Fix ? '0 0 20px rgba(16,185,129,0.12), 0 3px 10px rgba(0,0,0,0.12)' : '0 2px 6px rgba(0,0,0,0.06)' }}>
+                      <div style={{ width: 40, height: 22, borderRadius: 11, background: editingModule.hasFasada2Fix ? 'linear-gradient(135deg, rgba(16,185,129,0.92) 0%, rgba(5,150,105,0.92) 100%)' : 'rgba(255,255,255,0.08)', position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada2Fix ? '0 2px 6px rgba(16,185,129,0.25)' : 'none' }}><div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff', position: 'absolute', top: 3, left: editingModule.hasFasada2Fix ? 21 : 3, transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)' }} /></div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 2 - Fiksna</div>
+                      {editingModule.hasFasada2Fix && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(16,185,129,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
+                    </button>
+
+                    <button onClick={() => toggleFasada3PodiznoKlizna(editingModuleId)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: editingModule.hasFasada3PodiznoKlizna ? 'linear-gradient(135deg, rgba(234,179,8,0.14) 0%, rgba(234,179,8,0.07) 100%)' : 'rgba(255,255,255,0.03)', border: editingModule.hasFasada3PodiznoKlizna ? '2px solid rgba(234,179,8,0.48)' : '2px solid rgba(255,255,255,0.08)', borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada3PodiznoKlizna ? '0 0 20px rgba(234,179,8,0.12), 0 3px 10px rgba(0,0,0,0.12)' : '0 2px 6px rgba(0,0,0,0.06)' }}>
+                      <div style={{ width: 40, height: 22, borderRadius: 11, background: editingModule.hasFasada3PodiznoKlizna ? 'linear-gradient(135deg, rgba(234,179,8,0.92) 0%, rgba(202,138,4,0.92) 100%)' : 'rgba(255,255,255,0.08)', position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada3PodiznoKlizna ? '0 2px 6px rgba(234,179,8,0.25)' : 'none' }}><div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff', position: 'absolute', top: 3, left: editingModule.hasFasada3PodiznoKlizna ? 21 : 3, transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)' }} /></div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 3 - Podizno klizna</div>
+                      {editingModule.hasFasada3PodiznoKlizna && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(234,179,8,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
+                    </button>
+
+                    <button onClick={() => toggleFasada3Fix(editingModuleId)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: editingModule.hasFasada3Fix ? 'linear-gradient(135deg, rgba(239,68,68,0.14) 0%, rgba(239,68,68,0.07) 100%)' : 'rgba(255,255,255,0.03)', border: editingModule.hasFasada3Fix ? '2px solid rgba(239,68,68,0.48)' : '2px solid rgba(255,255,255,0.08)', borderRadius: 13, padding: '11px 14px', cursor: 'pointer', textAlign: 'left', transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada3Fix ? '0 0 20px rgba(239,68,68,0.12), 0 3px 10px rgba(0,0,0,0.12)' : '0 2px 6px rgba(0,0,0,0.06)' }}>
+                      <div style={{ width: 40, height: 22, borderRadius: 11, background: editingModule.hasFasada3Fix ? 'linear-gradient(135deg, rgba(239,68,68,0.92) 0%, rgba(220,38,38,0.92) 100%)' : 'rgba(255,255,255,0.08)', position: 'relative', flexShrink: 0, transition: 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: editingModule.hasFasada3Fix ? '0 2px 6px rgba(239,68,68,0.25)' : 'none' }}><div style={{ width: 16, height: 16, borderRadius: '50%', background: '#fff', position: 'absolute', top: 3, left: editingModule.hasFasada3Fix ? 21 : 3, transition: 'left 0.4s cubic-bezier(0.4, 0, 0.2, 1)', boxShadow: '0 2px 5px rgba(0,0,0,0.25)' }} /></div>
+                      <div style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.93)' }}>Fasada 3 - Fiksna</div>
+                      {editingModule.hasFasada3Fix && (<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(239,68,68,0.92)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>)}
+                    </button>
+                    </>)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      <style>{`
+        @keyframes spin { 
+          from { transform: rotate(0deg) } 
+          to { transform: rotate(360deg) } 
+        }
+        
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 8px;
+        }
+        
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: rgba(255,255,255,0.02);
+          border-radius: 10px;
+          margin: 4px 0;
+        }
+        
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: linear-gradient(180deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0.08) 100%);
+          border-radius: 10px;
+          border: 2px solid transparent;
+          background-clip: padding-box;
+        }
+        
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: linear-gradient(180deg, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0.12) 100%);
+          background-clip: padding-box;
+        }
+      `}</style>
+    </div>
+  );
+}

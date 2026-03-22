@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GLB Inspector</title>
+  <style>
+    body {
+      background: #1a1a1a;
+      color: #e0e0e0;
+      font-family: 'Courier New', monospace;
+      padding: 20px;
+      margin: 0;
+    }
+    h1 {
+      color: #4fc3f7;
+      border-bottom: 2px solid #4fc3f7;
+      padding-bottom: 10px;
+    }
+    .group {
+      background: rgba(255,255,255,0.05);
+      padding: 8px 12px;
+      margin: 4px 0;
+      border-left: 3px solid #4fc3f7;
+      border-radius: 4px;
+    }
+    .stats {
+      background: rgba(76, 175, 80, 0.1);
+      border: 1px solid rgba(76, 175, 80, 0.3);
+      padding: 15px;
+      border-radius: 8px;
+      margin: 20px 0;
+    }
+    pre {
+      background: rgba(0,0,0,0.3);
+      padding: 15px;
+      border-radius: 8px;
+      overflow-x: auto;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔍 Large_Full_Final.glb Structure Inspector</h1>
+  <div id="output">Loading...</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    const output = document.getElementById('output');
+
+    const loader = new GLTFLoader();
+
+    loader.load(
+      '/modules/large_full_final.glb',
+      (gltf) => {
+        const scene = gltf.scene;
+        const groups = [];
+        const meshes = [];
+        let totalObjects = 0;
+
+        function traverseScene(obj, depth = 0) {
+          totalObjects++;
+          const indent = '  '.repeat(depth);
+          
+          if (obj.name && obj.name.trim() !== '') {
+            if (obj.type === 'Group' || obj.type === 'Object3D') {
+              groups.push({ name: obj.name, type: obj.type, depth });
+            } else if (obj.type === 'Mesh') {
+              meshes.push({ name: obj.name, type: obj.type, depth });
+            }
+          }
+          
+          if (obj.children && obj.children.length > 0) {
+            obj.children.forEach(child => traverseScene(child, depth + 1));
+          }
+        }
+
+        traverseScene(scene);
+
+        // Generate output
+        let html = '<div class="stats">';
+        html += `<h2>📊 Statistics</h2>`;
+        html += `<p><strong>Total Objects:</strong> ${totalObjects}</p>`;
+        html += `<p><strong>Named Groups/Objects:</strong> ${groups.length}</p>`;
+        html += `<p><strong>Named Meshes:</strong> ${meshes.length}</p>`;
+        html += '</div>';
+
+        html += '<h2>📦 Named Groups (for visibility control)</h2>';
+        if (groups.length > 0) {
+          groups.forEach((g, idx) => {
+            html += `<div class="group">${idx + 1}. <strong>${g.name}</strong> <small style="color: #888">(${g.type})</small></div>`;
+          });
+        } else {
+          html += '<p style="color: #ff6b6b;">⚠️ No named groups found</p>';
+        }
+
+        html += '<h2>🔷 Named Meshes</h2>';
+        if (meshes.length > 0) {
+          meshes.forEach((m, idx) => {
+            html += `<div class="group">${idx + 1}. <strong>${m.name}</strong> <small style="color: #888">(${m.type})</small></div>`;
+          });
+        } else {
+          html += '<p style="color: #ff6b6b;">⚠️ No named meshes found</p>';
+        }
+
+        // Full tree structure
+        html += '<h2>🌲 Full Scene Tree</h2>';
+        html += '<pre>';
+        
+        function printTree(obj, depth = 0) {
+          const indent = '  '.repeat(depth);
+          let line = `${indent}${obj.type}`;
+          if (obj.name && obj.name.trim() !== '') {
+            line += `: "${obj.name}"`;
+          }
+          html += line + '\n';
+          
+          if (obj.children && obj.children.length > 0) {
+            obj.children.forEach(child => printTree(child, depth + 1));
+          }
+        }
+
+        printTree(scene);
+        html += '</pre>';
+
+        // JavaScript code to copy
+        html += '<h2>💻 Group Names Array (for TypeScript interface)</h2>';
+        html += '<pre style="background: rgba(76, 175, 80, 0.1); border: 1px solid rgba(76, 175, 80, 0.3);">';
+        html += 'const groupNames = [\n';
+        groups.forEach(g => {
+          html += `  '${g.name}',\n`;
+        });
+        html += '];\n\n';
+        html += `// Total: ${groups.length} groups`;
+        html += '</pre>';
+
+        output.innerHTML = html;
+      },
+      (xhr) => {
+        output.innerHTML = `<p>Loading: ${(xhr.loaded / xhr.total * 100).toFixed(1)}%</p>`;
+      },
+      (error) => {
+        output.innerHTML = `<p style="color: #ff6b6b;">❌ Error loading GLB: ${error.message}</p>`;
+        console.error('Error:', error);
+      }
+    );
+  </script>
+</body>
+</html>

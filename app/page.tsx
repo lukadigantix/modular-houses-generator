@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 // ---------------------------------------------------------------------------
 // Constants — 1 cell = 2.4 m in real life
@@ -46,6 +47,7 @@ interface DragState {
 // ---------------------------------------------------------------------------
 function moduleSize(m: PlacedModule): { w: number; h: number } {
   if (m.type === 'small' || m.type === 'tall') return { w: 1, h: 1 };
+  // large modules have rotation-dependent footprint
   return m.rotation % 2 !== 0 ? { w: 1, h: 2 } : { w: 2, h: 1 };
 }
 
