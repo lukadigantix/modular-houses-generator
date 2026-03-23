@@ -261,12 +261,18 @@ const GRASS_COLORS: Record<GrassType, number> = {
   beton:  0xaaaaaa,
 };
 
-function Scene3D({ modules, cols, rows, lightSettings, sceneSettings }: {
+function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingMode, clearAnnotationsRef, onAnnotationAdded, savedCameraRef, savedAnnotationsRef, onFillClick }: {
   modules: PlacedModule[];
   cols: number;
   rows: number;
   lightSettings: LightSettings;
   sceneSettings: SceneSettings;
+  isDrawingMode: boolean;
+  clearAnnotationsRef: React.MutableRefObject<(() => void) | null>;
+  onAnnotationAdded: () => void;
+  savedCameraRef: React.MutableRefObject<{ position: THREE.Vector3; target: THREE.Vector3 } | null>;
+  savedAnnotationsRef: React.MutableRefObject<THREE.Mesh[]>;
+  onFillClick: (mesh: THREE.Mesh, screenX: number, screenY: number) => void;
 }) {
   const mountRef     = useRef<HTMLDivElement>(null);
   const rendererRef  = useRef<THREE.WebGLRenderer | null>(null);
@@ -274,10 +280,15 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings }: {
   const hemiLightRef = useRef<THREE.HemisphereLight  | null>(null);
   const fillLightRef = useRef<THREE.DirectionalLight | null>(null);
   const sceneRef     = useRef<THREE.Scene            | null>(null);
+  const cameraRef    = useRef<THREE.PerspectiveCamera | null>(null);
+  const controlsRef  = useRef<OrbitControls          | null>(null);
+  const annoGroupRef = useRef<THREE.Group             | null>(null);
   const floorMatRef  = useRef<THREE.MeshStandardMaterial | null>(null);
   const floorSizeRef = useRef(80);
   const centerXRef   = useRef(0);
   const centerZRef   = useRef(0);
+  const onFillClickRef = useRef(onFillClick);
+  onFillClickRef.current = onFillClick;
   const lightSettingsRef  = useRef(lightSettings);
   const sceneSettingsRef  = useRef(sceneSettings);
   lightSettingsRef.current = lightSettings;
@@ -409,10 +420,30 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings }: {
       centerZ = (minR + maxR) / 2 * 2.4;
     }
 
-    // Camera
+    // Camera — restore saved position if available, otherwise use default
     const camera = new THREE.PerspectiveCamera(50, w / h, 0.1, 1000);
-    camera.position.set(centerX, 22, centerZ + 28);
+    if (savedCameraRef.current) {
+      camera.position.copy(savedCameraRef.current.position);
+    } else {
+      camera.position.set(centerX, 22, centerZ + 28);
+    }
     camera.lookAt(centerX, 0, centerZ);
+    cameraRef.current = camera;
+
+    // Persistent annotation group — survives drawing mode toggles
+    // Restore any previously saved annotation meshes from before 2D switch
+    const annoGroup = new THREE.Group();
+    annoGroupRef.current = annoGroup;
+    scene.add(annoGroup);
+    for (const mesh of savedAnnotationsRef.current) {
+      // Reset any leftover selection material before re-adding to scene
+      if (mesh.userData._prevMat) { mesh.material = mesh.userData._prevMat as THREE.Material; delete mesh.userData._prevMat; }
+      annoGroup.add(mesh);
+    }
+    clearAnnotationsRef.current = () => {
+      annoGroup.clear();
+      savedAnnotationsRef.current = [];
+    };
 
     // Lights — colors & positions applied dynamically via applyLighting()
     const hemi = new THREE.HemisphereLight(0xb0d4ff, 0x8a9a70, 1.2);
@@ -613,11 +644,17 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings }: {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping  = true;
     controls.dampingFactor  = 0.06;
-    controls.target.set(centerX, 0, centerZ);
+    const savedTarget = savedCameraRef.current?.target;
+    controls.target.set(
+      savedTarget ? savedTarget.x : centerX,
+      savedTarget ? savedTarget.y : 0,
+      savedTarget ? savedTarget.z : centerZ,
+    );
     controls.minDistance    = 4;
     controls.maxDistance    = 200;
     controls.maxPolarAngle  = Math.PI / 2 - 0.02;
     controls.update();
+    controlsRef.current = controls;
 
     // Render loop
     let animId: number;
@@ -639,6 +676,17 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings }: {
     observer.observe(mount);
 
     return () => {
+      // Save camera state before teardown
+      savedCameraRef.current = {
+        position: camera.position.clone(),
+        target:   controls.target.clone(),
+      };
+      // Save annotation meshes before teardown so they survive the unmount
+      const annoGroup = annoGroupRef.current;
+      if (annoGroup) {
+        savedAnnotationsRef.current = annoGroup.children.slice() as THREE.Mesh[];
+        annoGroup.clear(); // detach from scene without disposing
+      }
       cancelAnimationFrame(animId);
       observer.disconnect();
       controls.dispose();
@@ -650,10 +698,434 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings }: {
       fillLightRef.current = null;
       floorMatRef.current  = null;
       sceneRef.current     = null;
+      cameraRef.current    = null;
+      controlsRef.current  = null;
+      annoGroupRef.current = null;
       rendererRef.current  = null;
     };
   // Re-init when modules, cols, or rows change
   }, [modules, cols, rows]);
+
+  // ── Drawing / annotation in 3D space ────────────────────────────────────
+  useEffect(() => {
+    const renderer  = rendererRef.current;
+    const scene     = sceneRef.current;
+    const camera    = cameraRef.current;
+    const controls  = controlsRef.current;
+    const annoGroup = annoGroupRef.current;
+    if (!renderer || !scene || !camera || !controls || !annoGroup) return;
+
+    controls.enabled = !isDrawingMode;
+    renderer.domElement.style.cursor = isDrawingMode ? 'crosshair' : '';
+    if (!isDrawingMode) return;
+
+    const SNAP_RADIUS = 0.55; // meters — snap zone for endpoints
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.02);
+    const raycaster   = new THREE.Raycaster();
+
+    // Materials
+    const annoMat = new THREE.MeshStandardMaterial({
+      color: 0xff2222, roughness: 0.2, metalness: 0.0, emissive: 0xff2222, emissiveIntensity: 0.5,
+    });
+    const selMat = new THREE.MeshStandardMaterial({
+      color: 0xffaa22, roughness: 0.2, metalness: 0.0, emissive: 0xffaa22, emissiveIntensity: 0.8,
+    });
+
+    // Yellow snap-point dot
+    const snapDot = new THREE.Mesh(
+      new THREE.SphereGeometry(0.14, 10, 10),
+      new THREE.MeshStandardMaterial({ color: 0xffff00, emissive: 0xffff00, emissiveIntensity: 1.0 }),
+    );
+    snapDot.visible = false;
+    snapDot.position.y = 0.14;
+    scene.add(snapDot);
+
+    // ── Polygon fill detection ───────────────────────────────────────────
+    const MERGE_D = SNAP_RADIUS * 0.75;
+    const updateFills = () => {
+      // Save existing fill colors keyed by sorted border-line UUIDs so we can restore them
+      const savedColors = new Map<string, string>();
+      const toRemove = annoGroup.children.filter(c => (c as THREE.Mesh).userData.isFill) as THREE.Mesh[];
+      for (const m of toRemove) {
+        const bl = m.userData.borderLines as THREE.Mesh[] | undefined;
+        if (bl) {
+          const key = bl.map(l => l.uuid).sort().join(',');
+          savedColors.set(key, (m.userData.fillColorHex as string) ?? '#ffdd00');
+        }
+        annoGroup.remove(m); m.geometry.dispose(); (m.material as THREE.Material).dispose();
+      }
+
+      const lines = annoGroup.children.filter(
+        c => c !== previewMesh && !(c as THREE.Mesh).userData.isFill && (c as THREE.Mesh).userData.ptA,
+      ) as THREE.Mesh[];
+      if (lines.length < 3) return;
+
+      const nodes: THREE.Vector3[] = [];
+      const getNode = (pt: THREE.Vector3): number => {
+        for (let i = 0; i < nodes.length; i++) if (nodes[i].distanceTo(pt) < MERGE_D) return i;
+        nodes.push(pt.clone()); return nodes.length - 1;
+      };
+      const edges: [number, number][] = [];
+      for (const line of lines) {
+        const a = getNode(line.userData.ptA as THREE.Vector3);
+        const b = getNode(line.userData.ptB as THREE.Vector3);
+        if (a !== b) edges.push([a, b]);
+      }
+
+      const adj = new Map<number, number[]>();
+      for (let i = 0; i < nodes.length; i++) adj.set(i, []);
+      for (const [a, b] of edges) { adj.get(a)!.push(b); adj.get(b)!.push(a); }
+
+      const visited = new Set<number>();
+      const getComp = (start: number): number[] => {
+        const comp: number[] = [], q = [start];
+        while (q.length) {
+          const n = q.pop()!;
+          if (visited.has(n)) continue;
+          visited.add(n); comp.push(n);
+          for (const nb of (adj.get(n) ?? [])) if (!visited.has(nb)) q.push(nb);
+        }
+        return comp;
+      };
+
+      for (const startNode of adj.keys()) {
+        if (visited.has(startNode)) continue;
+        const comp = getComp(startNode);
+        if (comp.length < 3) continue;
+        if (!comp.every(n => (adj.get(n)?.length ?? 0) >= 2)) continue;
+        const path: number[] = [comp[0]];
+        let cur = comp[0], prev = -1, safety = 0;
+        while (safety++ < 2000) {
+          const nexts = (adj.get(cur) ?? []).filter(n => n !== prev);
+          if (!nexts.length) break;
+          const next = nexts[0];
+          if (next === path[0] && path.length >= 3) {
+            const compSet = new Set(comp);
+            const borderLines = lines.filter(l => {
+              const na = getNode(l.userData.ptA as THREE.Vector3);
+              const nb = getNode(l.userData.ptB as THREE.Vector3);
+              return compSet.has(na) && compSet.has(nb);
+            });
+            const colorKey = borderLines.map(l => l.uuid).sort().join(',');
+            const savedHex = savedColors.get(colorKey) ?? '#ffdd00';
+            const c = new THREE.Color(savedHex);
+            const pts2d = path.map(i => new THREE.Vector2(nodes[i].x, nodes[i].z));
+            const geo = new THREE.ShapeGeometry(new THREE.Shape(pts2d));
+            geo.applyMatrix4(new THREE.Matrix4().makeRotationX(Math.PI / 2));
+            const mat = new THREE.MeshStandardMaterial({
+              color: c.clone(), transparent: true, opacity: 0.28,
+              side: THREE.DoubleSide, depthWrite: false, roughness: 1.0, metalness: 0.0,
+              emissive: c.clone(), emissiveIntensity: 0.12,
+            });
+            const fillMesh = new THREE.Mesh(geo, mat);
+            fillMesh.position.y = 0.015;
+            fillMesh.userData.isFill = true;
+            fillMesh.userData.fillColorHex = savedHex;
+            fillMesh.userData.borderLines = borderLines;
+            annoGroup.add(fillMesh);
+            break;
+          }
+          if (path.includes(next)) break;
+          path.push(next); prev = cur; cur = next;
+        }
+      }
+    };
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+    const makeTube = (a: THREE.Vector3, b: THREE.Vector3, mat: THREE.Material = annoMat): THREE.Mesh => {
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      const geo  = len > 0.001
+        ? new THREE.CylinderGeometry(0.06, 0.06, len, 8)
+        : new THREE.CylinderGeometry(0.06, 0.06, 0.001, 8);
+      const mesh = new THREE.Mesh(geo, mat);
+      if (len > 0.001) {
+        mesh.position.copy(new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5));
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+      }
+      mesh.userData.ptA = a.clone();
+      mesh.userData.ptB = b.clone();
+      return mesh;
+    };
+
+    const reshapeTube = (mesh: THREE.Mesh, a: THREE.Vector3, b: THREE.Vector3) => {
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      if (len < 0.001) return;
+      mesh.geometry.dispose();
+      mesh.geometry = new THREE.CylinderGeometry(0.06, 0.06, len, 8);
+      mesh.position.copy(new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5));
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+      mesh.userData.ptA = a.clone();
+      mesh.userData.ptB = b.clone();
+    };
+
+    const getGround = (ev: PointerEvent): THREE.Vector3 | null => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      const ndc  = new THREE.Vector2(
+        ((ev.clientX - rect.left) / rect.width)  * 2 - 1,
+        -((ev.clientY - rect.top)  / rect.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const pt = new THREE.Vector3();
+      return raycaster.ray.intersectPlane(groundPlane, pt) ? pt : null;
+    };
+
+    const snapOrtho = (start: THREE.Vector3, cur: THREE.Vector3): THREE.Vector3 =>
+      Math.abs(cur.x - start.x) >= Math.abs(cur.z - start.z)
+        ? new THREE.Vector3(cur.x, 0.02, start.z)
+        : new THREE.Vector3(start.x, 0.02, cur.z);
+
+    // Find nearest line endpoint within SNAP_RADIUS, optionally skipping a mesh
+    const findEndpoint = (pt: THREE.Vector3, skip?: THREE.Mesh): THREE.Vector3 | null => {
+      let best: THREE.Vector3 | null = null;
+      let bestDist = SNAP_RADIUS;
+      for (const child of annoGroup.children) {
+        if (child === skip || child === previewMesh || (child as THREE.Mesh).userData.isFill) continue;
+        const m = child as THREE.Mesh;
+        for (const key of ['ptA', 'ptB']) {
+          const ep = m.userData[key] as THREE.Vector3 | undefined;
+          if (!ep) continue;
+          const d = pt.distanceTo(ep);
+          if (d < bestDist) { bestDist = d; best = ep.clone(); }
+        }
+      }
+      return best;
+    };
+
+    const showSnap = (pt: THREE.Vector3 | null) => {
+      if (pt) { snapDot.position.set(pt.x, 0.14, pt.z); snapDot.visible = true; }
+      else    { snapDot.visible = false; }
+    };
+
+    // ── State ────────────────────────────────────────────────────────────
+    let selectedMesh:    THREE.Mesh | null = null;
+    let previewMesh:     THREE.Mesh | null = null;
+    let startPt:         THREE.Vector3 | null = null;
+    let isDragging       = false;
+    let isDraggingFill   = false;
+    let dragGroundStart: THREE.Vector3 | null = null;
+    let dragOrigA:       THREE.Vector3 | null = null;
+    let dragOrigB:       THREE.Vector3 | null = null;
+    let dragFillLines:   { mesh: THREE.Mesh; origA: THREE.Vector3; origB: THREE.Vector3 }[] = [];
+    let dragFillMesh:    THREE.Mesh | null = null;
+    let dragFillDownX    = 0;
+    let dragFillDownY    = 0;
+
+    const selectMesh = (m: THREE.Mesh) => {
+      if (selectedMesh === m) return;
+      deselect();
+      selectedMesh = m;
+      m.userData._prevMat = m.material;
+      m.material = selMat.clone();
+    };
+    const deselect = () => {
+      if (!selectedMesh) return;
+      selectedMesh.material = (selectedMesh.userData._prevMat as THREE.Material) ?? annoMat;
+      selectedMesh = null;
+    };
+    const syncSaved = () => {
+      savedAnnotationsRef.current = annoGroup.children.filter(c => c !== previewMesh) as THREE.Mesh[];
+    };
+
+    // ── Event handlers ───────────────────────────────────────────────────
+    const onDown = (ev: PointerEvent) => {
+      ev.stopPropagation();
+      renderer.domElement.setPointerCapture(ev.pointerId);
+      const gpt = getGround(ev);
+
+      // Raycast against committed line meshes
+      const rect = renderer.domElement.getBoundingClientRect();
+      raycaster.setFromCamera(new THREE.Vector2(
+        ((ev.clientX - rect.left) / rect.width)  * 2 - 1,
+        -((ev.clientY - rect.top)  / rect.height) * 2 + 1,
+      ), camera);
+      // Check fills first (they sit above lines at y=0.015)
+      const fillHits = raycaster.intersectObjects(
+        annoGroup.children.filter(c => (c as THREE.Mesh).userData.isFill), false,
+      );
+      if (fillHits.length > 0 && gpt) {
+        const hitFill = fillHits[0].object as THREE.Mesh;
+        const borderLines = hitFill.userData.borderLines as THREE.Mesh[] | undefined;
+        if (borderLines && borderLines.length > 0) {
+          deselect();
+          isDraggingFill  = true;
+          isDragging      = false;
+          dragGroundStart = gpt;
+          dragFillMesh    = hitFill;
+          dragFillDownX   = ev.clientX;
+          dragFillDownY   = ev.clientY;
+          dragFillLines   = borderLines.map(m => ({
+            mesh: m,
+            origA: (m.userData.ptA as THREE.Vector3).clone(),
+            origB: (m.userData.ptB as THREE.Vector3).clone(),
+          }));
+          return;
+        }
+      }
+
+      const hits = raycaster.intersectObjects(
+        annoGroup.children.filter(c => c !== previewMesh && !(c as THREE.Mesh).userData.isFill), false,
+      );
+
+      if (hits.length > 0) {
+        // Click hit an existing line → select & prepare drag
+        selectMesh(hits[0].object as THREE.Mesh);
+        isDragging       = true;
+        dragGroundStart  = gpt;
+        dragOrigA        = (selectedMesh!.userData.ptA as THREE.Vector3).clone();
+        dragOrigB        = (selectedMesh!.userData.ptB as THREE.Vector3).clone();
+      } else {
+        // Click on empty → deselect, start new line (snap start to endpoint)
+        deselect();
+        isDragging = false;
+        if (gpt) {
+          const snapped = findEndpoint(gpt);
+          startPt = snapped ?? gpt;
+          showSnap(snapped);
+        }
+      }
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      const gpt = getGround(ev);
+
+      // ── Move entire polygon (fill drag) ──
+      if (isDraggingFill && dragGroundStart && dragFillLines.length > 0) {
+        if (!gpt) return;
+        const delta = new THREE.Vector3().subVectors(gpt, dragGroundStart);
+        for (const { mesh, origA, origB } of dragFillLines) {
+          reshapeTube(mesh, origA.clone().add(delta), origB.clone().add(delta));
+        }
+        showSnap(null);
+        updateFills();
+        // updateFills recreated the fill mesh — keep dragFillMesh pointing to the new one
+        if (dragFillLines.length > 0) {
+          const origKey = dragFillLines.map(fl => fl.mesh.uuid).sort().join(',');
+          const newFill = annoGroup.children.find(c => {
+            const m = c as THREE.Mesh;
+            if (!m.userData.isFill || !m.userData.borderLines) return false;
+            return (m.userData.borderLines as THREE.Mesh[]).map(l => l.uuid).sort().join(',') === origKey;
+          }) as THREE.Mesh | undefined;
+          if (newFill) dragFillMesh = newFill;
+        }
+        return;
+      }
+
+      // ── Move selected line ──
+      if (isDragging && selectedMesh && dragGroundStart && dragOrigA && dragOrigB) {
+        if (!gpt) return;
+        const delta = new THREE.Vector3().subVectors(gpt, dragGroundStart);
+        const newA  = dragOrigA.clone().add(delta);
+        const newB  = dragOrigB.clone().add(delta);
+        // Snap the nearest of the two endpoints to any other line endpoint
+        const sA = findEndpoint(newA, selectedMesh);
+        const sB = findEndpoint(newB, selectedMesh);
+        const dA = sA ? newA.distanceTo(sA) : Infinity;
+        const dB = sB ? newB.distanceTo(sB) : Infinity;
+        let finalA = newA, finalB = newB;
+        if (sA && dA <= dB) {
+          const shift = new THREE.Vector3().subVectors(sA, newA);
+          finalA = sA; finalB = newB.clone().add(shift);
+          showSnap(sA);
+        } else if (sB) {
+          const shift = new THREE.Vector3().subVectors(sB, newB);
+          finalB = sB; finalA = newA.clone().add(shift);
+          showSnap(sB);
+        } else {
+          showSnap(null);
+        }
+        reshapeTube(selectedMesh, finalA, finalB);
+        updateFills();
+        return;
+      }
+
+      // ── Preview new line ──
+      if (!startPt || !gpt) { showSnap(null); return; }
+      const rawEnd  = snapOrtho(startPt, gpt);
+      const snapped = findEndpoint(rawEnd);
+      const end     = snapped ?? rawEnd;
+      showSnap(snapped);
+      if (previewMesh) { annoGroup.remove(previewMesh); previewMesh.geometry.dispose(); }
+      previewMesh = makeTube(startPt, end);
+      (previewMesh.material as THREE.MeshStandardMaterial).transparent = true;
+      (previewMesh.material as THREE.MeshStandardMaterial).opacity = 0.5;
+      annoGroup.add(previewMesh);
+    };
+
+    const onUp = (ev: PointerEvent) => {
+      showSnap(null);
+
+      if (isDraggingFill) {
+        const dx = ev.clientX - dragFillDownX;
+        const dy = ev.clientY - dragFillDownY;
+        const wasTap = Math.sqrt(dx * dx + dy * dy) < 6;
+        if (wasTap && dragFillMesh) {
+          onFillClickRef.current(dragFillMesh, ev.clientX, ev.clientY);
+        } else {
+          updateFills();
+          syncSaved();
+        }
+        isDraggingFill  = false;
+        dragGroundStart = null;
+        dragFillLines   = [];
+        dragFillMesh    = null;
+        return;
+      }
+
+      if (isDragging) {
+        isDragging = false;
+        dragGroundStart = null;
+        updateFills();
+        syncSaved();
+        return;
+      }
+
+      if (!startPt) return;
+      const gpt = getGround(ev);
+      if (gpt) {
+        const rawEnd  = snapOrtho(startPt, gpt);
+        const snapped = findEndpoint(rawEnd);
+        const end     = snapped ?? rawEnd;
+        if (previewMesh) { annoGroup.remove(previewMesh); previewMesh.geometry.dispose(); previewMesh = null; }
+        if (startPt.distanceTo(end) > 0.05) {
+          const solid = makeTube(startPt, end);
+          annoGroup.add(solid);
+          updateFills();
+          onAnnotationAdded();
+          syncSaved();
+        }
+      }
+      startPt = null;
+    };
+
+    renderer.domElement.addEventListener('pointerdown', onDown);
+    renderer.domElement.addEventListener('pointermove', onMove);
+    renderer.domElement.addEventListener('pointerup',   onUp);
+
+    clearAnnotationsRef.current = () => {
+      deselect();
+      annoGroup.clear();
+      savedAnnotationsRef.current = [];
+      previewMesh = null;
+      startPt     = null;
+    };
+
+    return () => {
+      renderer.domElement.removeEventListener('pointerdown', onDown);
+      renderer.domElement.removeEventListener('pointermove', onMove);
+      renderer.domElement.removeEventListener('pointerup',   onUp);
+      if (previewMesh) { annoGroup.remove(previewMesh); previewMesh.geometry.dispose(); }
+      scene.remove(snapDot);
+      snapDot.geometry.dispose();
+      (snapDot.material as THREE.Material).dispose();
+      deselect();
+      controls.enabled = true;
+      renderer.domElement.style.cursor = '';
+      clearAnnotationsRef.current = () => { annoGroup.clear(); savedAnnotationsRef.current = []; };
+    };
+  }, [isDrawingMode, clearAnnotationsRef, onAnnotationAdded, savedAnnotationsRef]);
+
 
   return (
     <div style={{ position: 'absolute', inset: 0 }}>
@@ -685,6 +1157,37 @@ export default function Home() {
   
   // Objekti modal
   const [objektiModalOpen, setObjektiModalOpen] = useState(false);
+
+  // Drawing / annotation tool
+  const [isDrawingMode, setIsDrawingMode] = useState(false);
+  const [hasAnnotations, setHasAnnotations] = useState(false);
+  const [fillPicker, setFillPicker] = useState<{ mesh: THREE.Mesh; x: number; y: number } | null>(null);
+  const clearAnnotationsRef = useRef<(() => void) | null>(null);
+  const savedCameraRef = useRef<{ position: THREE.Vector3; target: THREE.Vector3 } | null>(null);
+  const savedAnnotationsRef = useRef<THREE.Mesh[]>([]);
+
+  const FILL_COLORS = [
+    { hex: '#ffdd00', label: 'Žuta' },
+    { hex: '#ff4444', label: 'Crvena' },
+    { hex: '#44aaff', label: 'Plava' },
+    { hex: '#44dd88', label: 'Zelena' },
+    { hex: '#cc44ff', label: 'Ljubičasta' },
+    { hex: '#ff8833', label: 'Narandžasta' },
+    { hex: '#ffffff', label: 'Bela' },
+    { hex: '#333333', label: 'Tamna' },
+  ];
+
+  const applyFillColor = (hex: string) => {
+    if (!fillPicker) return;
+    const mesh = fillPicker.mesh;
+    mesh.userData.fillColorHex = hex;
+    const mat = mesh.material as THREE.MeshStandardMaterial;
+    const c = new THREE.Color(hex);
+    mat.color.copy(c);
+    mat.emissive.copy(c);
+    mat.needsUpdate = true;
+    setFillPicker(null);
+  };
 
 
 
@@ -1099,6 +1602,11 @@ export default function Home() {
   const handleLogout = async () => {
     await supabase.auth.signOut();
     window.location.href = '/login';
+  };
+
+  const clearAnnotations = () => {
+    clearAnnotationsRef.current?.();
+    setHasAnnotations(false);
   };
 
   // ---- Export PDF ----
@@ -1927,6 +2435,48 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               Snimi
             </button>
 
+            {/* ── Pencil / annotation tool ── */}
+            <button
+              onClick={() => setIsDrawingMode(p => !p)}
+              title={isDrawingMode ? 'Izađi iz načina crtanja' : 'Označi na 3D prikazu'}
+              style={{
+                marginLeft: 6,
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: isDrawingMode ? 'rgba(239,68,68,0.22)' : 'rgba(255,255,255,0.07)',
+                border: `1px solid ${isDrawingMode ? 'rgba(239,68,68,0.55)' : 'rgba(255,255,255,0.12)'}`,
+                borderRadius: 7, padding: '0 10px', height: 26, cursor: 'pointer',
+                color: isDrawingMode ? '#f87171' : 'rgba(255,255,255,0.7)', fontSize: 12, fontWeight: 600,
+                transition: 'all 0.15s',
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 20h9"/>
+                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+              </svg>
+              {isDrawingMode ? 'Zatvori' : 'Označi'}
+            </button>
+            {(isDrawingMode || hasAnnotations) && (
+              <button
+                onClick={clearAnnotations}
+                title="Obriši sve oznake"
+                style={{
+                  marginLeft: 4,
+                  display: 'flex', alignItems: 'center', gap: 5,
+                  background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)',
+                  borderRadius: 7, padding: '0 9px', height: 26, cursor: 'pointer',
+                  color: 'rgba(255,255,255,0.35)', fontSize: 12, fontWeight: 600,
+                  transition: 'all 0.15s',
+                }}
+                onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = '#f87171'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(239,68,68,0.3)'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.35)'; (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(255,255,255,0.08)'; }}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/>
+                </svg>
+                Obriši oznake
+              </button>
+            )}
+
           </>
         )}
       </div>
@@ -2240,7 +2790,47 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       </div>
       ) : (
       <div style={{ position: 'relative', height: 'calc(100vh - 56px)' }}>
-        <Scene3D modules={modules} cols={cols} rows={rows} lightSettings={lightSettings} sceneSettings={sceneSettings} />
+        <Scene3D modules={modules} cols={cols} rows={rows} lightSettings={lightSettings} sceneSettings={sceneSettings} isDrawingMode={isDrawingMode} clearAnnotationsRef={clearAnnotationsRef} onAnnotationAdded={() => setHasAnnotations(true)} savedCameraRef={savedCameraRef} savedAnnotationsRef={savedAnnotationsRef} onFillClick={(mesh, x, y) => setFillPicker({ mesh, x, y })} />
+        {fillPicker && (
+          <div onClick={() => setFillPicker(null)} style={{ position: 'fixed', inset: 0, zIndex: 9998 }}>
+            <div
+              onClick={e => e.stopPropagation()}
+              style={{
+                position: 'fixed',
+                left: Math.min(fillPicker.x + 14, window.innerWidth - 190),
+                top: Math.min(fillPicker.y + 14, window.innerHeight - 90),
+                zIndex: 9999,
+                background: 'rgba(18,20,30,0.97)',
+                border: '1px solid rgba(255,255,255,0.13)',
+                borderRadius: 12,
+                padding: '10px 12px 12px',
+                display: 'flex', flexDirection: 'column', gap: 9,
+                boxShadow: '0 10px 40px rgba(0,0,0,0.6)',
+              }}
+            >
+              <span style={{ color: 'rgba(255,255,255,0.45)', fontSize: 11, fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase' }}>Boja površine</span>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', maxWidth: 172 }}>
+                {FILL_COLORS.map(({ hex, label }) => (
+                  <button
+                    key={hex}
+                    title={label}
+                    onClick={() => applyFillColor(hex)}
+                    style={{
+                      width: 26, height: 26, borderRadius: '50%',
+                      background: hex,
+                      border: hex === '#ffffff' ? '2px solid rgba(255,255,255,0.3)' : '2px solid rgba(0,0,0,0.2)',
+                      cursor: 'pointer', padding: 0,
+                      boxShadow: '0 2px 8px rgba(0,0,0,0.35)',
+                      transition: 'transform 0.1s, box-shadow 0.1s',
+                    }}
+                    onMouseEnter={e => { const b = e.currentTarget as HTMLButtonElement; b.style.transform = 'scale(1.25)'; b.style.boxShadow = `0 0 10px ${hex}`; }}
+                    onMouseLeave={e => { const b = e.currentTarget as HTMLButtonElement; b.style.transform = 'scale(1)'; b.style.boxShadow = '0 2px 8px rgba(0,0,0,0.35)'; }}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
         {modules.length === 0 && (
           <div style={{
             position: 'absolute', inset: 0,
