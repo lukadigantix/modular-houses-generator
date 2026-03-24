@@ -5,6 +5,7 @@ import { supabase } from '@/lib/supabase';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js';
 
 // ---------------------------------------------------------------------------
 // Constants — 1 cell = 2.4 m in real life
@@ -261,7 +262,7 @@ const GRASS_COLORS: Record<GrassType, number> = {
   beton:  0xaaaaaa,
 };
 
-function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingMode, clearAnnotationsRef, onAnnotationAdded, savedCameraRef, savedAnnotationsRef, onFillClick }: {
+function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingMode, clearAnnotationsRef, onAnnotationAdded, savedCameraRef, savedAnnotationsRef, onFillClick, exportSTLRef }: {
   modules: PlacedModule[];
   cols: number;
   rows: number;
@@ -273,6 +274,7 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
   savedCameraRef: React.MutableRefObject<{ position: THREE.Vector3; target: THREE.Vector3 } | null>;
   savedAnnotationsRef: React.MutableRefObject<THREE.Mesh[]>;
   onFillClick: (mesh: THREE.Mesh, screenX: number, screenY: number) => void;
+  exportSTLRef: React.MutableRefObject<(() => void) | null>;
 }) {
   const mountRef     = useRef<HTMLDivElement>(null);
   const rendererRef  = useRef<THREE.WebGLRenderer | null>(null);
@@ -443,6 +445,45 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
     clearAnnotationsRef.current = () => {
       annoGroup.clear();
       savedAnnotationsRef.current = [];
+    };
+
+    exportSTLRef.current = () => {
+      const sc = sceneRef.current;
+      if (!sc) return;
+      sc.updateMatrixWorld(true);
+      const exportGroup = new THREE.Group();
+      sc.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        // skip annotations and fills
+        if (mesh.userData.ptA || mesh.userData.isFill) return;
+        // skip invisible (check whole ancestor chain)
+        let visible = true;
+        let cur: THREE.Object3D | null = mesh;
+        while (cur) { if (!cur.visible) { visible = false; break; } cur = cur.parent; }
+        if (!visible) return;
+        // only include meshes that live inside a module-* group
+        let inModule = false;
+        let par: THREE.Object3D | null = mesh.parent;
+        while (par) { if (par.name.startsWith('module-')) { inModule = true; break; } par = par.parent; }
+        if (!inModule) return;
+        const clonedGeo = mesh.geometry.clone();
+        clonedGeo.applyMatrix4(mesh.matrixWorld);
+        const clonedMesh = new THREE.Mesh(clonedGeo);
+        exportGroup.add(clonedMesh);
+      });
+      if (exportGroup.children.length === 0) return;
+      const exporter = new STLExporter();
+      const stlData = exporter.parse(exportGroup, { binary: true });
+      const blob = new Blob([stlData as unknown as ArrayBuffer], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `modular-${Date.now()}.stl`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     };
 
     // Lights — colors & positions applied dynamically via applyLighting()
@@ -702,6 +743,7 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
       controlsRef.current  = null;
       annoGroupRef.current = null;
       rendererRef.current  = null;
+      exportSTLRef.current = null;
     };
   // Re-init when modules, cols, or rows change
   }, [modules, cols, rows]);
@@ -1163,6 +1205,7 @@ export default function Home() {
   const [hasAnnotations, setHasAnnotations] = useState(false);
   const [fillPicker, setFillPicker] = useState<{ mesh: THREE.Mesh; x: number; y: number } | null>(null);
   const clearAnnotationsRef = useRef<(() => void) | null>(null);
+  const exportSTLRef = useRef<(() => void) | null>(null);
   const savedCameraRef = useRef<{ position: THREE.Vector3; target: THREE.Vector3 } | null>(null);
   const savedAnnotationsRef = useRef<THREE.Mesh[]>([]);
 
@@ -2232,6 +2275,33 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
             </button>
           )}
 
+          {modules.length > 0 && view === '3d' && (
+            <button
+              onClick={() => exportSTLRef.current?.()}
+              style={{
+                background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 8, padding: '6px 13px',
+                color: 'rgba(255,255,255,0.6)', cursor: 'pointer',
+                fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+                transition: 'all 0.12s', display: 'flex', alignItems: 'center', gap: 5,
+              }}
+              onMouseEnter={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.12)';
+                (e.currentTarget as HTMLButtonElement).style.color = '#fff';
+              }}
+              onMouseLeave={e => {
+                (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.06)';
+                (e.currentTarget as HTMLButtonElement).style.color = 'rgba(255,255,255,0.6)';
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" style={{ opacity: 0.7 }}>
+                <path d="M8 1a7 7 0 100 14A7 7 0 008 1zM7 4h2v5H7V4zm0 6h2v2H7v-2z" fill="none"/>
+                <path d="M4 2h8v2H4zM3 4h10l-1 7H4L3 4zM6 8h4M6 10h4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+              </svg>
+              STL
+            </button>
+          )}
+
           {modules.length > 0 && (
             <button
               onClick={() => setModules([])}
@@ -2790,7 +2860,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       </div>
       ) : (
       <div style={{ position: 'relative', height: 'calc(100vh - 56px)' }}>
-        <Scene3D modules={modules} cols={cols} rows={rows} lightSettings={lightSettings} sceneSettings={sceneSettings} isDrawingMode={isDrawingMode} clearAnnotationsRef={clearAnnotationsRef} onAnnotationAdded={() => setHasAnnotations(true)} savedCameraRef={savedCameraRef} savedAnnotationsRef={savedAnnotationsRef} onFillClick={(mesh, x, y) => setFillPicker({ mesh, x, y })} />
+        <Scene3D modules={modules} cols={cols} rows={rows} lightSettings={lightSettings} sceneSettings={sceneSettings} isDrawingMode={isDrawingMode} clearAnnotationsRef={clearAnnotationsRef} onAnnotationAdded={() => setHasAnnotations(true)} savedCameraRef={savedCameraRef} savedAnnotationsRef={savedAnnotationsRef} onFillClick={(mesh, x, y) => setFillPicker({ mesh, x, y })} exportSTLRef={exportSTLRef} />
         {fillPicker && (
           <div onClick={() => setFillPicker(null)} style={{ position: 'fixed', inset: 0, zIndex: 9998 }}>
             <div
