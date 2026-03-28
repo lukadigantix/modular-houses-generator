@@ -18,3 +18,17 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* ── Tablet scaling ─────────────────────────────────────────────
+   On touch devices (tablets) scale down toolbar, stats bar, and
+   the options modal so all controls fit in the viewport.
+   The grid and 2D/3D view are NOT affected.
+──────────────────────────────────────────────────────────────── */
+@media (pointer: coarse) {
+  .tablet-ui {
+    zoom: 0.8;
+  }
+  .tablet-modal-inner {
+    zoom: 0.72;
+  }
+}

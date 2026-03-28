@@ -2030,7 +2030,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       )}
 
       {/* ── Toolbar ──────────────────────────────────────────────── */}
-      <header style={{
+      <header className="tablet-ui" style={{
         borderBottom: '1px solid rgba(255,255,255,0.06)',
         background: '#0d0d10',
         display: 'flex',
@@ -2470,7 +2470,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       </header>
 
       {/* ── Stats bar ────────────────────────────────────────────── */}
-      <div style={{
+      <div className="tablet-ui" style={{
         borderBottom: '1px solid rgba(255,255,255,0.04)',
         background: '#0a0a0d',
         display: 'flex',
@@ -3106,7 +3106,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
             }}
             onClick={(e) => { if (e.target === e.currentTarget) setOptionsModalOpen(false); }}
           >
-            <div style={{
+            <div className="tablet-modal-inner" style={{
               background: 'linear-gradient(135deg, rgba(17,17,24,0.98) 0%, rgba(24,24,36,0.98) 100%)',
               border: '1px solid rgba(255,255,255,0.08)',
               borderRadius: 20, 
