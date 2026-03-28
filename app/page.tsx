@@ -1852,6 +1852,22 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
     [modules],
   );
 
+  // ---- Touch drag start ----
+  const handleTouchStart = useCallback(
+    (e: React.TouchEvent, id: string) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      const m = modules.find(m => m.id === id);
+      if (!m || !gridRef.current) return;
+      const rect    = gridRef.current.getBoundingClientRect();
+      const z       = zoomRef.current;
+      const offsetX = (touch.clientX - rect.left) / z - m.col * CELL;
+      const offsetY = (touch.clientY - rect.top)  / z - m.row * CELL;
+      setDrag({ id, offsetX, offsetY, ghostCol: m.col, ghostRow: m.row });
+    },
+    [modules],
+  );
+
   // ---- Drag move + drop ----
   useEffect(() => {
     if (!drag) return;
@@ -1885,11 +1901,31 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       setDrag(null);
     };
 
+    const onTouchMove = (e: TouchEvent) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      const rect = gridRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const z    = zoomRef.current;
+      const rawX = (touch.clientX - rect.left) / z - drag.offsetX;
+      const rawY = (touch.clientY - rect.top)  / z - drag.offsetY;
+      const snap = (v: number) => Math.round(v / CELL * 2) / 2;
+      setDrag(d =>
+        d ? { ...d, ghostCol: snap(rawX), ghostRow: snap(rawY) } : null,
+      );
+    };
+
+    const onTouchEnd = () => onUp();
+
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup',   onUp);
+    window.addEventListener('touchmove',  onTouchMove, { passive: false });
+    window.addEventListener('touchend',   onTouchEnd);
     return () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup',   onUp);
+      window.removeEventListener('touchmove',  onTouchMove);
+      window.removeEventListener('touchend',   onTouchEnd);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drag, modules]);
@@ -2690,6 +2726,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               <div
                 key={m.id}
                 onMouseDown={e => handleMouseDown(e, m.id)}
+                onTouchStart={e => handleTouchStart(e, m.id)}
                 style={{
                   position:   'absolute',
                   left:       m.col * CELL,
