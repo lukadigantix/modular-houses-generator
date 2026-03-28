@@ -30,7 +30,7 @@ interface LightSettings {
   sunElevation: number; // 5-85°
 }
 
-type GrassType = 'trava' | 'suva' | 'zemlja' | 'pesak' | 'beton';
+type GrassType = 'trava' | 'suva' | 'zemlja' | 'pesak' | 'beton' | 'dark';
 interface SceneSettings {
   grass:      GrassType;
   fogEnabled: boolean;
@@ -260,6 +260,7 @@ const GRASS_COLORS: Record<GrassType, number> = {
   zemlja: 0x7a5c3a,
   pesak:  0xd4c08a,
   beton:  0xaaaaaa,
+  dark:   0x232330,
 };
 
 function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingMode, clearAnnotationsRef, onAnnotationAdded, savedCameraRef, savedAnnotationsRef, onFillClick, exportSTLRef }: {
@@ -285,7 +286,9 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
   const cameraRef    = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef  = useRef<OrbitControls          | null>(null);
   const annoGroupRef = useRef<THREE.Group             | null>(null);
-  const floorMatRef  = useRef<THREE.MeshStandardMaterial | null>(null);
+  const floorMatRef       = useRef<THREE.MeshStandardMaterial | null>(null);
+  const gridHelperLightRef = useRef<THREE.GridHelper | null>(null);
+  const gridHelperDarkRef  = useRef<THREE.GridHelper | null>(null);
   const floorSizeRef = useRef(80);
   const centerXRef   = useRef(0);
   const centerZRef   = useRef(0);
@@ -312,33 +315,38 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
     const lx = cX + Math.sin(azRad) * hDist;
     const ly = dist * Math.sin(elevRad);
     const lz = cZ - Math.cos(azRad) * hDist;
+    const isDarkGround = sceneSettingsRef.current.grass === 'dark';
     if (ls.isDay) {
-      renderer.toneMappingExposure = 1.4;
-      (scene.background as THREE.Color).setHex(0x87ceeb);
-      (scene.fog as THREE.FogExp2).color.setHex(0xb0d8f0);
-      (scene.fog as THREE.FogExp2).density = 0.003;
-      hemi.color.setHex(0xb0d4ff);
-      hemi.groundColor.setHex(0x8a9a70);
-      hemi.intensity = 1.2;
-      dirLight.color.setHex(0xfff8e7);
-      dirLight.intensity = 3.5;
+      renderer.toneMappingExposure = isDarkGround ? 1.0 : 1.4;
+      if (!isDarkGround) {
+        (scene.background as THREE.Color).setHex(0x87ceeb);
+        (scene.fog as THREE.FogExp2).color.setHex(0xb0d8f0);
+        (scene.fog as THREE.FogExp2).density = 0.003;
+      }
+      hemi.color.setHex(isDarkGround ? 0x3464a0 : 0xb0d4ff);
+      hemi.groundColor.setHex(isDarkGround ? 0x1a1a28 : 0x8a9a70);
+      hemi.intensity = isDarkGround ? 0.7 : 1.2;
+      dirLight.color.setHex(isDarkGround ? 0xfff5e8 : 0xfff8e7);
+      dirLight.intensity = isDarkGround ? 2.0 : 3.5;
       dirLight.position.set(lx, ly, lz);
-      fillLight.color.setHex(0xd0e8ff);
-      fillLight.intensity = 1.2;
+      fillLight.color.setHex(isDarkGround ? 0x6a90c0 : 0xd0e8ff);
+      fillLight.intensity = isDarkGround ? 0.9 : 1.2;
       fillLight.position.set(cX - Math.sin(azRad) * 35, 25, cZ + Math.cos(azRad) * 35);
     } else {
-      renderer.toneMappingExposure = 0.7;
-      (scene.background as THREE.Color).setHex(0x050d1a);
-      (scene.fog as THREE.FogExp2).color.setHex(0x050d1a);
-      (scene.fog as THREE.FogExp2).density = 0.005;
-      hemi.color.setHex(0x1a2a4a);
-      hemi.groundColor.setHex(0x050508);
-      hemi.intensity = 0.25;
-      dirLight.color.setHex(0xb0c8e8);
-      dirLight.intensity = 0.7;
+      renderer.toneMappingExposure = isDarkGround ? 1.0 : 0.7;
+      if (!isDarkGround) {
+        (scene.background as THREE.Color).setHex(0x050d1a);
+        (scene.fog as THREE.FogExp2).color.setHex(0x050d1a);
+        (scene.fog as THREE.FogExp2).density = 0.005;
+      }
+      hemi.color.setHex(isDarkGround ? 0x3464a0 : 0x1a2a4a);
+      hemi.groundColor.setHex(isDarkGround ? 0x1a1a28 : 0x050508);
+      hemi.intensity = isDarkGround ? 0.7 : 0.25;
+      dirLight.color.setHex(isDarkGround ? 0xfff5e8 : 0xb0c8e8);
+      dirLight.intensity = isDarkGround ? 2.0 : 0.7;
       dirLight.position.set(lx, ly, lz);
-      fillLight.color.setHex(0x1a2a4a);
-      fillLight.intensity = 0.15;
+      fillLight.color.setHex(isDarkGround ? 0x6a90c0 : 0x1a2a4a);
+      fillLight.intensity = isDarkGround ? 0.9 : 0.15;
       fillLight.position.set(cX - Math.sin(azRad) * 35, 25, cZ + Math.cos(azRad) * 35);
     }
     dirLight.shadow.camera.updateProjectionMatrix();
@@ -348,6 +356,28 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
     const mat   = floorMatRef.current;
     const scene = sceneRef.current;
     if (!mat || !scene) return;
+
+    // Toggle light/dark grid helper
+    if (gridHelperLightRef.current) gridHelperLightRef.current.visible = ss.grass !== 'dark';
+    if (gridHelperDarkRef.current)  gridHelperDarkRef.current.visible  = ss.grass === 'dark';
+
+    if (ss.grass === 'dark') {
+      // Old-style dark scene (dark navy background + grid)
+      if (mat.map) { mat.map.dispose(); mat.map = null; }
+      mat.color.setHex(0x232330);
+      mat.roughness = 0.88;
+      mat.metalness = 0.05;
+      mat.needsUpdate = true;
+      (scene.background as THREE.Color).setHex(0x1b3458);
+      (scene.fog as THREE.FogExp2).color.setHex(0x1b3458);
+      (scene.fog as THREE.FogExp2).density = 0.006;
+      return;
+    }
+
+    // Switching back from dark mode — restore sky based on current lighting
+    (scene.background as THREE.Color).setHex(lightSettingsRef.current.isDay ? 0x87ceeb : 0x050d1a);
+    (scene.fog as THREE.FogExp2).color.setHex(lightSettingsRef.current.isDay ? 0xb0d8f0 : 0x050d1a);
+
     if (mat.map) { mat.map.dispose(); mat.map = null; }
     if (ss.grass === 'trava') {
       const tex = new THREE.TextureLoader().load('/grass.jpg', (t) => {
@@ -365,7 +395,7 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
       mat.map = createGroundTexture(ss.grass);
       mat.color.setHex(0xffffff);
     }
-    const roughnessMap: Record<GrassType, number> = { trava: 0.92, suva: 0.88, zemlja: 0.95, pesak: 0.78, beton: 0.65 };
+    const roughnessMap: Record<GrassType, number> = { trava: 0.92, suva: 0.88, zemlja: 0.95, pesak: 0.78, beton: 0.65, dark: 0.88 };
     mat.roughness = roughnessMap[ss.grass];
     mat.needsUpdate = true;
     (scene.fog as THREE.FogExp2).density = ss.fogEnabled ? 0.003 : 0;
@@ -528,15 +558,23 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
     scene.add(floor);
     applyScene(sceneSettingsRef.current);
 
-    // Grid lines
-    const gridHelper = new THREE.GridHelper(
-      Math.max(cols, rows) * 2.4 + 10,
-      Math.max(cols, rows) + 4,
-      0x6a7c5a,
-      0x7a8e68,
-    );
-    gridHelper.position.set(centerX, 0.01, centerZ);
-    scene.add(gridHelper);
+    // Grid lines — two helpers: one for day/outdoor, one for dark mode
+    const gridSize = Math.max(cols, rows) * 2.4 + 10;
+    const gridDivs = Math.max(cols, rows) + 4;
+    const gridHelperLight = new THREE.GridHelper(gridSize, gridDivs, 0x6a7c5a, 0x7a8e68);
+    gridHelperLight.position.set(centerX, 0.01, centerZ);
+    scene.add(gridHelperLight);
+    gridHelperLightRef.current = gridHelperLight;
+
+    const gridHelperDark = new THREE.GridHelper(gridSize, gridDivs, 0x2d2d3c, 0x272732);
+    gridHelperDark.position.set(centerX, 0.01, centerZ);
+    scene.add(gridHelperDark);
+    gridHelperDarkRef.current = gridHelperDark;
+
+    // Initial visibility based on current scene settings
+    const initDark = sceneSettingsRef.current.grass === 'dark';
+    gridHelperLight.visible = !initDark;
+    gridHelperDark.visible  = initDark;
 
     // Modules — rendered as GLB models only
 
@@ -1185,7 +1223,7 @@ export default function Home() {
   const [zoom,    setZoom]    = useState(1);
   const [view,    setView]    = useState<'2d' | '3d'>('2d');
   const [lightSettings, setLightSettings] = useState<LightSettings>({ isDay: true, sunAngle: 63, sunElevation: 53 });
-  const [sceneSettings, setSceneSettings] = useState<SceneSettings>({ grass: 'trava', fogEnabled: true });
+  const [sceneSettings, setSceneSettings] = useState<SceneSettings>({ grass: 'dark', fogEnabled: true });
   const [cols,    setCols]    = useState(DEFAULT_COLS);
 
   const sunDirectionLabel = (angle: number): string => {
@@ -1196,7 +1234,7 @@ export default function Home() {
   const [genSmall, setGenSmall] = useState(2);
   const [genLarge, setGenLarge] = useState(4);
   const [genTall,  setGenTall]  = useState(0);
-  
+
   // Objekti modal
   const [objektiModalOpen, setObjektiModalOpen] = useState(false);
 
@@ -2949,122 +2987,121 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
             </p>
           </div>
         )}
-        {/* ── Environment (scene) panel ────────────────────────── */}
+        {/* ── Environment pill ─────────────────────────────────── */}
         <div style={{
-          position: 'absolute', bottom: 80, left: 24, zIndex: 10,
-          background: 'rgba(10,15,25,0.82)', backdropFilter: 'blur(12px)',
-          borderRadius: 14, padding: '16px 18px', width: 226,
-          border: '1px solid rgba(255,255,255,0.10)',
-          boxShadow: '0 8px 32px rgba(0,0,0,0.55)',
-          color: '#fff',
+          position: 'absolute', left: 24, top: '50%', transform: 'translateY(-50%)', zIndex: 10,
+          display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5,
+          background: 'rgba(8,10,18,0.72)', backdropFilter: 'blur(16px)',
+          borderRadius: 40, padding: '8px 7px',
+          border: '1px solid rgba(255,255,255,0.07)',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.45)',
         }}>
-          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.09em', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 14 }}>
-            🌿&nbsp; Okruženje
-          </div>
-          {/* Teren */}
-          <div style={{ marginBottom: 14 }}>
-            <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 8 }}>Podloga</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {([
-                { key: 'trava',  label: '🌿 Trava',  color: '#4ade80' },
-                { key: 'suva',   label: '🌾 Suva',   color: '#d4a84b' },
-                { key: 'zemlja', label: '🪨 Zemlja', color: '#92614a' },
-                { key: 'pesak',  label: '🏖 Pesak',  color: '#e2c97e' },
-                { key: 'beton',  label: '🧱 Beton',  color: '#9ca3af' },
-              ] as { key: GrassType; label: string; color: string }[]).map(opt => (
-                <button key={opt.key}
-                  onClick={() => setSceneSettings(p => ({ ...p, grass: opt.key }))}
-                  style={{
-                    padding: '5px 10px', borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: 'pointer',
-                    border: `1px solid ${sceneSettings.grass === opt.key ? opt.color : 'rgba(255,255,255,0.08)'}`,
-                    background: sceneSettings.grass === opt.key ? `${opt.color}22` : 'rgba(255,255,255,0.04)',
-                    color: sceneSettings.grass === opt.key ? opt.color : '#64748b',
-                  }}
-                >{opt.label}</button>
-              ))}
-            </div>
-          </div>
-          {/* Magla */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span style={{ fontSize: 11, color: '#94a3b8' }}>🌫 Magla / Izmaglica</span>
-            <button
-              onClick={() => setSceneSettings(p => ({ ...p, fogEnabled: !p.fogEnabled }))}
-              style={{
-                width: 40, height: 22, borderRadius: 11, border: 'none', cursor: 'pointer',
-                background: sceneSettings.fogEnabled ? '#3b82f6' : 'rgba(255,255,255,0.12)',
-                position: 'relative', transition: 'background 0.2s',
-              }}
-            >
-              <span style={{
-                position: 'absolute', top: 3, left: sceneSettings.fogEnabled ? 20 : 3,
-                width: 16, height: 16, borderRadius: '50%', background: '#fff',
-                transition: 'left 0.2s', display: 'block',
-              }} />
-            </button>
-          </div>
+          {([
+            { key: 'dark',   dot: '#3b5ea6' },
+            { key: 'trava',  dot: '#4ade80' },
+            { key: 'suva',   dot: '#d4a84b' },
+            { key: 'zemlja', dot: '#92614a' },
+            { key: 'pesak',  dot: '#e2c97e' },
+            { key: 'beton',  dot: '#9ca3af' },
+          ] as { key: GrassType; dot: string }[]).map(opt => {
+            const active = sceneSettings.grass === opt.key;
+            return (
+              <button key={opt.key}
+                title={opt.key.charAt(0).toUpperCase() + opt.key.slice(1)}
+                onClick={() => setSceneSettings(p => ({ ...p, grass: opt.key }))}
+                style={{
+                  width: active ? 28 : 22, height: active ? 28 : 22,
+                  borderRadius: '50%', border: 'none', cursor: 'pointer', padding: 0,
+                  background: active ? opt.dot : `${opt.dot}55`,
+                  boxShadow: active ? `0 0 0 2px rgba(255,255,255,0.18), 0 0 12px ${opt.dot}66` : 'none',
+                  transition: 'all 0.18s cubic-bezier(.4,0,.2,1)',
+                  flexShrink: 0,
+                }}
+              />
+            );
+          })}
+          <div style={{ width: 18, height: 1, background: 'rgba(255,255,255,0.08)', margin: '3px 0', flexShrink: 0 }} />
+          <button
+            title={sceneSettings.fogEnabled ? 'Magla uključena' : 'Magla isključena'}
+            onClick={() => setSceneSettings(p => ({ ...p, fogEnabled: !p.fogEnabled }))}
+            style={{
+              width: 28, height: 28, borderRadius: '50%', border: 'none', cursor: 'pointer', padding: 0,
+              background: sceneSettings.fogEnabled ? 'rgba(99,155,255,0.22)' : 'rgba(255,255,255,0.04)',
+              color: sceneSettings.fogEnabled ? 'rgba(140,180,255,0.9)' : 'rgba(255,255,255,0.2)',
+              fontSize: 14, transition: 'all 0.18s',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              boxShadow: sceneSettings.fogEnabled ? '0 0 10px rgba(99,155,255,0.3)' : 'none',
+            }}
+          >〜</button>
         </div>
         {/* ── Lighting control panel ───────────────────────────── */}
+        {/* ── Lighting pill ────────────────────────────────────── */}
         <div style={{
-          position: 'absolute', bottom: 60, right: 24, zIndex: 10,
-          background: 'rgba(10,15,25,0.82)', backdropFilter: 'blur(12px)',
-          borderRadius: 14, padding: '16px 18px', width: 248,
-          border: '1px solid rgba(255,255,255,0.10)',
-          boxShadow: '0 8px 32px rgba(0,0,0,0.55)',
-          color: '#fff',
+          position: 'absolute', right: 24, top: '50%', transform: 'translateY(-50%)', zIndex: 10,
+          display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5,
+          background: 'rgba(8,10,18,0.72)', backdropFilter: 'blur(16px)',
+          borderRadius: 40, padding: '8px 7px',
+          border: '1px solid rgba(255,255,255,0.07)',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.45)',
         }}>
-          <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.09em', color: '#94a3b8', textTransform: 'uppercase', marginBottom: 14 }}>
-            {lightSettings.isDay ? '☀️' : '🌙'}&nbsp; Svetlost
-          </div>
           {/* Dan / Noć */}
-          <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
-            <button
-              onClick={() => setLightSettings(p => ({ ...p, isDay: true }))}
-              style={{
-                flex: 1, padding: '7px 0', borderRadius: 8, fontSize: 12, fontWeight: 600,
-                border: `1px solid ${lightSettings.isDay ? '#f59e0b' : 'rgba(255,255,255,0.08)'}`,
-                cursor: 'pointer',
-                background: lightSettings.isDay ? '#f59e0b' : 'rgba(255,255,255,0.05)',
-                color: lightSettings.isDay ? '#000' : '#64748b',
-              }}
-            >☀️ Dan</button>
-            <button
-              onClick={() => setLightSettings(p => ({ ...p, isDay: false }))}
-              style={{
-                flex: 1, padding: '7px 0', borderRadius: 8, fontSize: 12, fontWeight: 600,
-                border: `1px solid ${!lightSettings.isDay ? '#3b82f6' : 'rgba(255,255,255,0.08)'}`,
-                cursor: 'pointer',
-                background: !lightSettings.isDay ? '#3b82f6' : 'rgba(255,255,255,0.05)',
-                color: !lightSettings.isDay ? '#fff' : '#64748b',
-              }}
-            >🌙 Noć</button>
-          </div>
-          {/* Pravac sunca */}
-          <div style={{ marginBottom: 14 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>Pravac {lightSettings.isDay ? 'sunca' : 'meseca'}</span>
-              <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b' }}>{sunDirectionLabel(lightSettings.sunAngle)}</span>
-            </div>
+          <button
+            title="Dan"
+            onClick={() => setLightSettings(p => ({ ...p, isDay: true }))}
+            style={{
+              width: lightSettings.isDay ? 28 : 22, height: lightSettings.isDay ? 28 : 22,
+              borderRadius: '50%', border: 'none', cursor: 'pointer', padding: 0, fontSize: 14,
+              background: lightSettings.isDay ? 'rgba(245,158,11,0.25)' : 'rgba(255,255,255,0.04)',
+              boxShadow: lightSettings.isDay ? '0 0 0 2px rgba(255,255,255,0.18), 0 0 12px rgba(245,158,11,0.5)' : 'none',
+              transition: 'all 0.18s cubic-bezier(.4,0,.2,1)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+            }}
+          >☀️</button>
+          <button
+            title="Noć"
+            onClick={() => setLightSettings(p => ({ ...p, isDay: false }))}
+            style={{
+              width: !lightSettings.isDay ? 28 : 22, height: !lightSettings.isDay ? 28 : 22,
+              borderRadius: '50%', border: 'none', cursor: 'pointer', padding: 0, fontSize: 14,
+              background: !lightSettings.isDay ? 'rgba(59,130,246,0.25)' : 'rgba(255,255,255,0.04)',
+              boxShadow: !lightSettings.isDay ? '0 0 0 2px rgba(255,255,255,0.18), 0 0 12px rgba(59,130,246,0.5)' : 'none',
+              transition: 'all 0.18s cubic-bezier(.4,0,.2,1)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+            }}
+          >🌙</button>
+          <div style={{ width: 18, height: 1, background: 'rgba(255,255,255,0.08)', margin: '3px 0', flexShrink: 0 }} />
+          {/* Pravac sunca — vertical slider */}
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+            <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.18)', letterSpacing: '0.06em', textTransform: 'uppercase', writingMode: 'vertical-rl', transform: 'rotate(180deg)', userSelect: 'none' }}>S</span>
             <input type="range" min={0} max={359} step={1} value={lightSettings.sunAngle}
               onChange={e => setLightSettings(p => ({ ...p, sunAngle: +e.target.value }))}
-              style={{ width: '100%', cursor: 'pointer', accentColor: '#f59e0b' }}
+              title={`Pravac: ${sunDirectionLabel(lightSettings.sunAngle)}`}
+              style={{
+                writingMode: 'vertical-lr', direction: 'rtl',
+                width: 4, height: 80, cursor: 'pointer',
+                accentColor: lightSettings.isDay ? '#f59e0b' : '#3b82f6',
+                appearance: 'slider-vertical' as React.CSSProperties['appearance'],
+                WebkitAppearance: 'slider-vertical',
+              }}
             />
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475569', marginTop: 3 }}>
-              <span>S</span><span>I</span><span>J</span><span>Z</span><span>S</span>
-            </div>
+            <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.18)', letterSpacing: '0.06em', textTransform: 'uppercase', writingMode: 'vertical-rl', transform: 'rotate(180deg)', userSelect: 'none' }}>J</span>
           </div>
-          {/* Visina sunca */}
-          <div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>Visina</span>
-              <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b' }}>{lightSettings.sunElevation}°</span>
-            </div>
+          <div style={{ width: 18, height: 1, background: 'rgba(255,255,255,0.08)', margin: '3px 0', flexShrink: 0 }} />
+          {/* Visina */}
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+            <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.18)', letterSpacing: '0.06em', userSelect: 'none' }}>▲</span>
             <input type="range" min={5} max={85} step={1} value={lightSettings.sunElevation}
               onChange={e => setLightSettings(p => ({ ...p, sunElevation: +e.target.value }))}
-              style={{ width: '100%', cursor: 'pointer', accentColor: '#f59e0b' }}
+              title={`Visina: ${lightSettings.sunElevation}°`}
+              style={{
+                writingMode: 'vertical-lr', direction: 'rtl',
+                width: 4, height: 64, cursor: 'pointer',
+                accentColor: lightSettings.isDay ? '#f59e0b' : '#3b82f6',
+                appearance: 'slider-vertical' as React.CSSProperties['appearance'],
+                WebkitAppearance: 'slider-vertical',
+              }}
             />
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#475569', marginTop: 3 }}>
-              <span>Nizak</span><span>Visok</span>
-            </div>
+            <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.18)', letterSpacing: '0.06em', userSelect: 'none' }}>▼</span>
           </div>
         </div>
       </div>
