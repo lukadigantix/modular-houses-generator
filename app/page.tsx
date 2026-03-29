@@ -2366,31 +2366,28 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
           </button>
         </div>
 
-        {/* ── Center: Istorija ── */}
-        <button
-          onClick={openHistory}
-          title="Istorija rasporeda"
-          style={{
-            position: 'absolute', left: '50%', transform: 'translateX(-50%)',
-            height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-            padding: '0 16px',
-            background: historyOpen ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.06)',
-            border: '1px solid rgba(255,255,255,0.13)', borderRadius: 8,
-            color: historyOpen ? '#fff' : 'rgba(255,255,255,0.6)', cursor: 'pointer',
-            transition: 'all 0.12s', flexShrink: 0, fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap',
-          }}
-          onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; e.currentTarget.style.color = '#fff'; }}
-          onMouseLeave={e => { e.currentTarget.style.background = historyOpen ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = historyOpen ? '#fff' : 'rgba(255,255,255,0.6)'; }}
-        >
-          <svg width="13" height="13" viewBox="0 0 13 13" fill="none" style={{ flexShrink: 0 }}>
-            <circle cx="6.5" cy="6.5" r="5.5" stroke="currentColor" strokeWidth="1.4"/>
-            <path d="M6.5 3.5V6.5L8.5 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
-          </svg>
-          Istorija
-        </button>
-
         {/* ── Right: Export + Delete + Zoom + 2D/3D ── */}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+          {/* History icon */}
+          <button
+            onClick={openHistory}
+            title="Istorija rasporeda"
+            style={{
+              height: 32, width: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              padding: 0,
+              background: historyOpen ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.13)', borderRadius: 8,
+              color: historyOpen ? '#fff' : 'rgba(255,255,255,0.6)', cursor: 'pointer',
+              transition: 'all 0.12s', flexShrink: 0,
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; e.currentTarget.style.color = '#fff'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = historyOpen ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = historyOpen ? '#fff' : 'rgba(255,255,255,0.6)'; }}
+          >
+            <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+              <circle cx="7.5" cy="7.5" r="6" stroke="currentColor" strokeWidth="1.4"/>
+              <path d="M7.5 4V7.5L9.5 9.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
           {modules.length > 0 && (
             <button
               onClick={openSaveModal}
