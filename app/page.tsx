@@ -1655,28 +1655,93 @@ export default function Home() {
     setModules(generateLayout(genSmall, genLarge, genTall, cols, rows));
   };
 
-  // ---- Save layout ----
-  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  // ---- Save layout (with project form modal) ----
+  const [saveStatus, setSaveStatus]       = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveModalOpen, setSaveModalOpen] = useState(false);
+  const [saveFormName,  setSaveFormName]  = useState('');
+  const [saveFormNotes, setSaveFormNotes] = useState('');
+
+  const openSaveModal = () => {
+    if (modules.length === 0) return;
+    setSaveFormName('');
+    setSaveFormNotes('');
+    setSaveModalOpen(true);
+  };
 
   const handleSaveLayout = async () => {
     if (modules.length === 0) return;
     setSaveStatus('saving');
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) { setSaveStatus('error'); return; }
+    if (!user) { setSaveStatus('error'); setSaveModalOpen(false); return; }
     const area = modules.reduce((sum, m) => {
       const { w, h } = moduleSize(m);
       return sum + w * 2.4 * h * 2.4;
     }, 0);
+    const largeCount    = modules.filter(m => m.type === 'large').length;
+    const smallCount    = modules.filter(m => m.type === 'small' || m.type === 'medium').length;
+    const deckCount     = modules.filter(m => m.type === 'deck' || m.type === 'smalldeck').length;
     const { error } = await supabase.from('layouts').insert({
-      user_id: user.id,
-      layout: modules,
-      large_count: 0,
-      small_count: 0,
-      tall_count:  null,
+      user_id:       user.id,
+      layout:        modules,
+      name:          saveFormName.trim() || null,
+      notes:         saveFormNotes.trim() || null,
+      large_count:   largeCount,
+      small_count:   smallCount,
+      tall_count:    deckCount,
       total_area_m2: parseFloat(area.toFixed(2)),
     });
-    if (error) { setSaveStatus('error'); setTimeout(() => setSaveStatus('idle'), 3000); }
-    else { setSaveStatus('saved'); setTimeout(() => setSaveStatus('idle'), 2500); }
+    if (error) {
+      setSaveStatus('error');
+      setTimeout(() => setSaveStatus('idle'), 3000);
+    } else {
+      setSaveStatus('saved');
+      setSaveModalOpen(false);
+      setTimeout(() => setSaveStatus('idle'), 2500);
+      if (historyOpen) fetchHistory();
+    }
+  };
+
+  // ---- History ----
+  type HistoryEntry = {
+    id: string;
+    created_at: string;
+    layout: PlacedModule[];
+    total_area_m2: number;
+    name: string | null;
+    notes: string | null;
+  };
+  const [historyOpen,    setHistoryOpen]    = useState(false);
+  const [historyItems,   setHistoryItems]   = useState<HistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const fetchHistory = async () => {
+    setHistoryLoading(true);
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) { setHistoryLoading(false); return; }
+    const { data } = await supabase
+      .from('layouts')
+      .select('id, created_at, layout, total_area_m2, name, notes')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    setHistoryItems((data as HistoryEntry[]) ?? []);
+    setHistoryLoading(false);
+  };
+
+  const openHistory = () => {
+    setHistoryOpen(true);
+    fetchHistory();
+  };
+
+  const loadFromHistory = (entry: HistoryEntry) => {
+    setModules(entry.layout);
+    setHistoryOpen(false);
+  };
+
+  const deleteFromHistory = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    await supabase.from('layouts').delete().eq('id', id);
+    setHistoryItems(prev => prev.filter(h => h.id !== id));
   };
 
   // ---- Logout ----
@@ -2301,25 +2366,48 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
           </button>
         </div>
 
+        {/* ── Center: Istorija ── */}
+        <button
+          onClick={openHistory}
+          title="Istorija rasporeda"
+          style={{
+            position: 'absolute', left: '50%', transform: 'translateX(-50%)',
+            height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+            padding: '0 16px',
+            background: historyOpen ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.13)', borderRadius: 8,
+            color: historyOpen ? '#fff' : 'rgba(255,255,255,0.6)', cursor: 'pointer',
+            transition: 'all 0.12s', flexShrink: 0, fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap',
+          }}
+          onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; e.currentTarget.style.color = '#fff'; }}
+          onMouseLeave={e => { e.currentTarget.style.background = historyOpen ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = historyOpen ? '#fff' : 'rgba(255,255,255,0.6)'; }}
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none" style={{ flexShrink: 0 }}>
+            <circle cx="6.5" cy="6.5" r="5.5" stroke="currentColor" strokeWidth="1.4"/>
+            <path d="M6.5 3.5V6.5L8.5 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+          </svg>
+          Istorija
+        </button>
+
         {/* ── Right: Export + Delete + Zoom + 2D/3D ── */}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
           {modules.length > 0 && (
             <button
-              onClick={handleSaveLayout}
+              onClick={openSaveModal}
               disabled={saveStatus === 'saving'}
               style={{
                 background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 8, padding: '6px 13px',
-                color: saveStatus === 'error' ? '#f87171' : 'rgba(255,255,255,0.6)',
+                border: '1px solid rgba(255,255,255,0.13)',
+                borderRadius: 8, padding: '0 16px', height: 32,
+                color: saveStatus === 'error' ? '#f87171' : saveStatus === 'saved' ? '#86efac' : 'rgba(255,255,255,0.6)',
                 cursor: saveStatus === 'saving' ? 'wait' : 'pointer',
-                fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap',
+                fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap',
                 transition: 'all 0.12s', display: 'flex', alignItems: 'center', gap: 5,
               }}
               onMouseEnter={e => { if (saveStatus === 'idle') { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; e.currentTarget.style.color = '#fff'; } }}
               onMouseLeave={e => { if (saveStatus === 'idle') { e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = 'rgba(255,255,255,0.6)'; } }}
             >
-              {saveStatus === 'error' ? 'Greška' : 'Sačuvaj'}
+              {saveStatus === 'saving' ? 'Čuvanje...' : saveStatus === 'saved' ? '✓ Sačuvano' : saveStatus === 'error' ? 'Greška' : 'Sačuvaj'}
             </button>
           )}
 
@@ -4495,6 +4583,310 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         }
       `}</style>
       <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+
+      {/* ── Save form modal ──────────────────────────────────────────── */}
+      {saveModalOpen && (() => {
+        const saveLarge  = modules.filter(m => m.type === 'large').length;
+        const saveSmall  = modules.filter(m => m.type === 'small' || m.type === 'medium').length;
+        const saveDeck   = modules.filter(m => m.type === 'deck' || m.type === 'smalldeck').length;
+        const saveTotal  = modules.length;
+        return (
+          <div
+            onClick={() => setSaveModalOpen(false)}
+            style={{ position: 'fixed', inset: 0, zIndex: 950, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          >
+            <div
+              onClick={e => e.stopPropagation()}
+              style={{
+                width: 400, background: 'rgba(12,14,26,0.98)', backdropFilter: 'blur(24px)',
+                borderRadius: 16, border: '1px solid rgba(255,255,255,0.09)',
+                padding: '24px', display: 'flex', flexDirection: 'column', gap: 16,
+                fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif',
+                boxShadow: '0 24px 80px rgba(0,0,0,0.6)',
+              }}
+            >
+              {/* Header */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ color: '#fff', fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em' }}>Sačuvaj raspored</span>
+                <button
+                  onClick={() => setSaveModalOpen(false)}
+                  style={{ width: 28, height: 28, borderRadius: '50%', border: 'none', background: 'rgba(255,255,255,0.07)', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                >×</button>
+              </div>
+
+              {/* Auto stats */}
+              <div style={{
+                background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+                borderRadius: 10, padding: '12px 14px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px',
+              }}>
+                <div>
+                  <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 10, fontWeight: 500, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 2 }}>Gabarit</div>
+                  <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
+                    {bbox ? `${bbox.w.toFixed(1)} × ${bbox.h.toFixed(1)} m` : '—'}
+                  </div>
+                </div>
+                <div>
+                  <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 10, fontWeight: 500, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 2 }}>Površina</div>
+                  <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
+                    {totalArea > 0 ? `${totalArea.toFixed(2)} m²` : '—'}
+                  </div>
+                </div>
+                <div>
+                  <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 10, fontWeight: 500, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 2 }}>Ukupno modula</div>
+                  <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: 600 }}>{saveTotal}</div>
+                </div>
+                <div>
+                  <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 10, fontWeight: 500, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 2 }}>Tipovi</div>
+                  <div style={{ color: 'rgba(255,255,255,0.65)', fontSize: 12, fontWeight: 500 }}>
+                    {[saveLarge > 0 && `${saveLarge}× large`, saveSmall > 0 && `${saveSmall}× small`, saveDeck > 0 && `${saveDeck}× deck`].filter(Boolean).join('  ·  ') || '—'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Project name */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12, fontWeight: 500 }}>Naziv projekta</label>
+                <input
+                  type="text"
+                  value={saveFormName}
+                  onChange={e => setSaveFormName(e.target.value)}
+                  placeholder="npr. Vila Jovanović – terasa"
+                  autoFocus
+                  style={{
+                    background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)',
+                    borderRadius: 9, padding: '9px 12px', color: '#fff', fontSize: 14, outline: 'none',
+                    fontFamily: 'inherit',
+                  }}
+                  onFocus={e => { e.currentTarget.style.borderColor = 'rgba(99,155,255,0.5)'; }}
+                  onBlur={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.10)'; }}
+                />
+              </div>
+
+              {/* Notes */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12, fontWeight: 500 }}>Napomena</label>
+                <textarea
+                  value={saveFormNotes}
+                  onChange={e => setSaveFormNotes(e.target.value)}
+                  placeholder="Klijentski zahtevi, lokacija, napomene…"
+                  rows={2}
+                  style={{
+                    background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)',
+                    borderRadius: 9, padding: '9px 12px', color: '#fff', fontSize: 13, outline: 'none',
+                    fontFamily: 'inherit', resize: 'vertical',
+                  }}
+                  onFocus={e => { e.currentTarget.style.borderColor = 'rgba(99,155,255,0.5)'; }}
+                  onBlur={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.10)'; }}
+                />
+              </div>
+
+              {/* Actions */}
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+                <button
+                  onClick={() => setSaveModalOpen(false)}
+                  style={{ padding: '8px 16px', borderRadius: 9, border: '1px solid rgba(255,255,255,0.10)', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 13, fontWeight: 500 }}
+                >Otkaži</button>
+                <button
+                  onClick={handleSaveLayout}
+                  disabled={saveStatus === 'saving'}
+                  style={{
+                    padding: '8px 20px', borderRadius: 9, border: 'none',
+                    background: 'rgba(99,155,255,0.18)', color: 'rgba(140,185,255,0.95)',
+                    cursor: saveStatus === 'saving' ? 'wait' : 'pointer',
+                    fontSize: 13, fontWeight: 600,
+                  }}
+                >
+                  {saveStatus === 'saving' ? 'Čuvanje...' : 'Sačuvaj'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── History modal ─────────────────────────────────────────────── */}
+      {historyOpen && (
+        <div
+          onClick={() => setHistoryOpen(false)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 950,
+            background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(12px)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              width: 520, maxHeight: '72vh',
+              background: 'linear-gradient(160deg, rgba(18,20,36,0.99) 0%, rgba(10,11,20,0.99) 100%)',
+              backdropFilter: 'blur(40px)',
+              borderRadius: 20, border: '1px solid rgba(255,255,255,0.08)',
+              display: 'flex', flexDirection: 'column',
+              fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif',
+              boxShadow: '0 40px 120px rgba(0,0,0,0.8), 0 0 0 1px rgba(255,255,255,0.04) inset',
+            }}
+          >
+            {/* ── Header ── */}
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '20px 24px 16px',
+              borderBottom: '1px solid rgba(255,255,255,0.06)',
+              flexShrink: 0,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{
+                  width: 32, height: 32, borderRadius: 9,
+                  background: 'rgba(99,155,255,0.12)', border: '1px solid rgba(99,155,255,0.2)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                }}>
+                  <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+                    <circle cx="7.5" cy="7.5" r="6.25" stroke="rgba(120,170,255,0.9)" strokeWidth="1.5"/>
+                    <path d="M7.5 4V7.5L10 9.5" stroke="rgba(120,170,255,0.9)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </div>
+                <div>
+                  <div style={{ color: '#fff', fontSize: 14, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1.2 }}>Istorija rasporeda</div>
+                  <div style={{ color: 'rgba(255,255,255,0.28)', fontSize: 11, marginTop: 1 }}>
+                    {historyItems.length > 0 ? `${historyItems.length} sačuvanih` : 'Nema unosa'}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => setHistoryOpen(false)}
+                style={{
+                  width: 30, height: 30, borderRadius: 9, border: '1px solid rgba(255,255,255,0.08)',
+                  background: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.4)',
+                  cursor: 'pointer', fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  transition: 'all 0.12s', lineHeight: 1,
+                }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.09)'; e.currentTarget.style.color = '#fff'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.15)'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; e.currentTarget.style.color = 'rgba(255,255,255,0.4)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'; }}
+              >×</button>
+            </div>
+
+            {/* ── List ── */}
+            <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px 16px' }} className="custom-scrollbar">
+              {historyLoading ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 120, gap: 12 }}>
+                  <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid rgba(99,155,255,0.2)', borderTopColor: 'rgba(99,155,255,0.7)', animation: 'spin 0.8s linear infinite' }} />
+                  <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: 12 }}>Učitavanje...</span>
+                </div>
+              ) : historyItems.length === 0 ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 140, gap: 10 }}>
+                  <div style={{ fontSize: 32, opacity: 0.15 }}>🗂</div>
+                  <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: 13 }}>Nema sačuvanih rasporeda</span>
+                </div>
+              ) : historyItems.map((entry, idx) => {
+                const d = new Date(entry.created_at);
+                const isToday = new Date().toDateString() === d.toDateString();
+                const dateStr = isToday
+                  ? `Danas · ${d.toLocaleTimeString('sr-RS', { hour: '2-digit', minute: '2-digit' })}`
+                  : d.toLocaleDateString('sr-RS', { day: '2-digit', month: 'long', year: 'numeric' }) + ' · ' + d.toLocaleTimeString('sr-RS', { hour: '2-digit', minute: '2-digit' });
+                const modCount = Array.isArray(entry.layout) ? entry.layout.length : 0;
+                return (
+                  <div
+                    key={entry.id}
+                    onClick={() => loadFromHistory(entry)}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 14,
+                      padding: '14px 16px', borderRadius: 12,
+                      marginBottom: idx < historyItems.length - 1 ? 6 : 0,
+                      cursor: 'pointer', position: 'relative', overflow: 'hidden',
+                      background: 'rgba(255,255,255,0.025)',
+                      border: '1px solid rgba(255,255,255,0.055)',
+                      transition: 'background 0.15s, border-color 0.15s',
+                    }}
+                    onMouseEnter={e => {
+                      (e.currentTarget as HTMLDivElement).style.background = 'rgba(99,155,255,0.07)';
+                      (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(99,155,255,0.22)';
+                    }}
+                    onMouseLeave={e => {
+                      (e.currentTarget as HTMLDivElement).style.background = 'rgba(255,255,255,0.025)';
+                      (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(255,255,255,0.055)';
+                    }}
+                  >
+                    {/* Icon */}
+                    <div style={{
+                      width: 40, height: 40, borderRadius: 10, flexShrink: 0,
+                      background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <rect x="2" y="2" width="5" height="5" rx="1.5" fill="rgba(255,255,255,0.25)"/>
+                        <rect x="9" y="2" width="5" height="5" rx="1.5" fill="rgba(255,255,255,0.15)"/>
+                        <rect x="2" y="9" width="5" height="5" rx="1.5" fill="rgba(255,255,255,0.15)"/>
+                        <rect x="9" y="9" width="5" height="5" rx="1.5" fill="rgba(255,255,255,0.08)"/>
+                      </svg>
+                    </div>
+
+                    {/* Content */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{
+                        color: 'rgba(255,255,255,0.88)', fontSize: 13, fontWeight: 600,
+                        letterSpacing: '-0.01em', marginBottom: 4,
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                      }}>
+                        {entry.name || `Raspored #${historyItems.length - idx}`}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 3,
+                          background: 'rgba(255,255,255,0.06)', borderRadius: 5,
+                          padding: '2px 7px', fontSize: 11, color: 'rgba(255,255,255,0.45)', fontWeight: 500,
+                        }}>
+                          {modCount} mod.
+                        </span>
+                        {entry.total_area_m2 ? (
+                          <span style={{
+                            display: 'inline-flex', alignItems: 'center', gap: 3,
+                            background: 'rgba(99,155,255,0.08)', borderRadius: 5,
+                            padding: '2px 7px', fontSize: 11, color: 'rgba(120,170,255,0.6)', fontWeight: 500,
+                          }}>
+                            {entry.total_area_m2} m²
+                          </span>
+                        ) : null}
+                        <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.22)', fontWeight: 400 }}>{dateStr}</span>
+                      </div>
+                      {entry.notes ? (
+                        <div style={{
+                          marginTop: 5, color: 'rgba(255,255,255,0.3)', fontSize: 11,
+                          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                        }}>{entry.notes}</div>
+                      ) : null}
+                    </div>
+
+                    {/* Delete */}
+                    <button
+                      onClick={e => deleteFromHistory(entry.id, e)}
+                      title="Obriši"
+                      style={{
+                        width: 28, height: 28, borderRadius: 8, border: '1px solid transparent',
+                        background: 'transparent', color: 'rgba(255,255,255,0.14)',
+                        cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        flexShrink: 0, transition: 'all 0.12s',
+                      }}
+                      onMouseEnter={e => {
+                        e.currentTarget.style.color = '#f87171';
+                        e.currentTarget.style.background = 'rgba(239,68,68,0.1)';
+                        e.currentTarget.style.borderColor = 'rgba(239,68,68,0.2)';
+                      }}
+                      onMouseLeave={e => {
+                        e.currentTarget.style.color = 'rgba(255,255,255,0.14)';
+                        e.currentTarget.style.background = 'transparent';
+                        e.currentTarget.style.borderColor = 'transparent';
+                      }}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                        <path d="M9 3L3 9M3 3l6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                      </svg>
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
