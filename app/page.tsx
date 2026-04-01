@@ -8,6 +8,31 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js';
 
 // ---------------------------------------------------------------------------
+// GLB cache — avoids reloading the same file from the server multiple times.
+// Keyed by URL; values are the original gltf.scene (never added to the scene
+// directly — always cloned before use).
+// ---------------------------------------------------------------------------
+const glbCache = new Map<string, THREE.Group>();
+const gltfLoader = new GLTFLoader();
+
+// Scale/pivot cache — avoids re-running Box3 for every module of the same GLB
+// type after the first load. Key: "${glbFile}:${fixedWidth}".
+interface GlbMeta { uniformScale: number; px: number; py: number; pz: number; }
+const glbMetaCache = new Map<string, GlbMeta>();
+
+// Dispose geometry and materials in an entire Object3D subtree (GPU cleanup).
+function disposeObject3D(obj: THREE.Object3D): void {
+  obj.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (mesh.isMesh) {
+      mesh.geometry?.dispose();
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      mats.forEach(mat => (mat as THREE.Material)?.dispose());
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Constants — 1 cell = 2.4 m in real life
 // ---------------------------------------------------------------------------
 const CELL         = 120;  // px (logical, before zoom)
@@ -148,6 +173,144 @@ function generateLayout(smallCount: number, largeCount: number, tallCount: numbe
 }
 
 // ---------------------------------------------------------------------------
+// Scene3D helpers — module-level so they are never recreated on re-render
+// ---------------------------------------------------------------------------
+
+/** Apply all PlacedModule visibility flags to a cloned gltf.scene node. */
+function applyVisibilityToModel(root: THREE.Object3D, m: PlacedModule): void {
+  const set = (name: string, vis: boolean) => {
+    const node = root.getObjectByName(name);
+    if (node) node.visible = vis;
+  };
+  set('konstrukcija',                  m.hasKonstrukcija);
+  set('stakleni_krov',                 m.hasStakleniKrov);
+  set('fasada_2_pun_zid',              m.hasFasada2PunZid);
+  set('fasada_1_sa_vratima',           m.hasFasada1SaVratima);
+  set('fasada_1_bez_vrata',            m.hasFasada1BezVrata);
+  set('fasada_4_podizno_klizniiiiiii', m.hasFasada4PodiznoKlizna);
+  set('fasada_4_fix',                  m.hasFasada4Fix);
+  set('fasada_4_kupatilo_prozor',      m.hasFasada4KupatiloProzor);
+  set('fasada_3_prozor_spavaca',       m.hasFasada3ProzorSpavaca);
+  set('fasada_3_pun_zid',              m.hasFasada3PunZid);
+  set('krov_pun',                      m.hasKrovPun);
+  set('fasada_4_pun_zid',              m.hasFasada4PunZid);
+  set('fasada_1_podizno_klizniiiiiii', m.hasFasada1PodiznoKlizna);
+  set('fasada_1_fix',                  m.hasFasada1Fix);
+  set('fasada_2_podizno_klizniiiiiii', m.hasFasada2PodiznoKlizna);
+  set('fasada_2_fix',                  m.hasFasada2Fix);
+  set('fasada_3_podizno_klizniiiiiii', m.hasFasada3PodiznoKlizna);
+  set('fasada_3_fix',                  m.hasFasada3Fix);
+  set('fasada_1_pun_zid',              m.hasFasada1PunZid);
+  set('fasada_1_sa_vratima_R',         m.hasFasada1SaVratimaR);
+  set('fasada_1_bez_vrata_R',          m.hasFasada1BezVrataR);
+  set('fasada_1_pun_zid_R',            m.hasFasada1PunZidR);
+  set('fasada_3_prozor_spavaca_R',     m.hasFasada3ProzorSpavacaR);
+  set('fasada_3_pun_zid_R',            m.hasFasada3PunZidR);
+  set('terasa_deck_otkrivena',         m.hasTerasaDeckOtkrivena);
+  set('terasa_velika_pergola',         m.hasTerasaVelikaPergola);
+  set('terasa_deck_mala',              m.hasTerasaDeckMala);
+  set('mala_pergola_desna_gore',       m.hasMalaPergolaDesnagore);
+  set('mala_pergola_leva_gore',        m.hasMalaPergolaLevaGore);
+}
+
+/**
+ * Create a THREE.Group for a module, add it to `scene`, and register it in
+ * `current`. GLB loading uses glbCache; scale/pivot uses glbMetaCache so the
+ * expensive Box3 pass only happens once per GLB type.
+ *
+ * NOTE: THREE.Object3D.clone() shares geometry & material references — no
+ * geometry data is duplicated in GPU memory per instance.
+ */
+function addModuleToScene(
+  scene: THREE.Scene,
+  m: PlacedModule,
+  current: Map<string, THREE.Group>,
+  onLoaded?: () => void,
+): boolean /* true = async load started, false = already cached */ {
+  const FIXED_WIDTH = (m.type === 'large' || m.type === 'deck') ? 4.8 : 2.4;
+  const FIXED_DEPTH = 2.4;
+  const metaKey = `${m.glbFile}:${FIXED_WIDTH}`;
+
+  const { w: gridW, h: gridH } = moduleSize(m);
+  const footprintCenterX = m.col * 2.4 + (gridW * 2.4) / 2;
+  const footprintCenterZ = m.row * 2.4 + (gridH * 2.4) / 2;
+
+  const moduleGroup = new THREE.Group();
+  moduleGroup.name = `module-${m.id}`;
+  moduleGroup.rotation.y = -m.rotation * (Math.PI / 2);
+  moduleGroup.position.set(footprintCenterX, 0, footprintCenterZ);
+  scene.add(moduleGroup);
+  current.set(m.id, moduleGroup);
+
+  const processSource = (source: THREE.Group) => {
+    if (!current.has(m.id)) return; // removed before async load completed
+    const modelName = m.type === 'large' ? 'large-full'
+      : m.type === 'deck' ? 'deck-full'
+      : m.type === 'smalldeck' ? 'smalldeck-full'
+      : m.type === 'medium' ? 'medium-full'
+      : 'small-full';
+    // clone() shares geometry + material buffers — no VRAM duplication
+    const modulModel = source.clone();
+    modulModel.name = modelName;
+
+    const cached = glbMetaCache.get(metaKey);
+    if (cached) {
+      modulModel.scale.setScalar(cached.uniformScale);
+      modulModel.position.set(cached.px, cached.py, cached.pz);
+    } else {
+      // Single Box3 pass — derive scaled pivot algebraically (uniform scale
+      // makes bbox1 = bbox0 * uniformScale; no second setFromObject needed).
+      const bbox0 = new THREE.Box3().setFromObject(modulModel);
+      const size0 = bbox0.getSize(new THREE.Vector3());
+      const center0 = bbox0.getCenter(new THREE.Vector3());
+      const uniformScale = Math.min(FIXED_WIDTH / size0.x, FIXED_DEPTH / size0.z);
+      const px = -center0.x * uniformScale;
+      const py = -bbox0.min.y * uniformScale;
+      const pz = -center0.z * uniformScale;
+      modulModel.scale.setScalar(uniformScale);
+      modulModel.position.set(px, py, pz);
+      glbMetaCache.set(metaKey, { uniformScale, px, py, pz });
+    }
+
+    // castShadow/receiveShadow are already set on the source (see below) and
+    // copied by Object3D.clone() — no traverse needed per instance.
+    applyVisibilityToModel(modulModel, m);
+    moduleGroup.add(modulModel);
+  };
+
+  const glbUrl = `/modules/${m.glbFile}`;
+  const cachedGlb = glbCache.get(glbUrl);
+  if (cachedGlb) {
+    processSource(cachedGlb);
+    return false;
+  } else {
+    gltfLoader.load(glbUrl, (gltf) => {
+      // Mark shadow flags on the source once — Object3D.clone() copies
+      // castShadow/receiveShadow, so every clone inherits them for free.
+      gltf.scene.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          child.castShadow    = true;
+          child.receiveShadow = true;
+        }
+      });
+      glbCache.set(glbUrl, gltf.scene);
+      processSource(gltf.scene);
+      onLoaded?.();
+    }, undefined, (err) => { console.warn(`[${m.glbFile}] load error:`, err); onLoaded?.(); });
+    return true;
+  }
+}
+
+/** Update position, rotation, and visibility of an already-rendered module. */
+function updateModuleInScene(group: THREE.Group, m: PlacedModule): void {
+  const { w: gridW, h: gridH } = moduleSize(m);
+  group.position.set(m.col * 2.4 + (gridW * 2.4) / 2, 0, m.row * 2.4 + (gridH * 2.4) / 2);
+  group.rotation.y = -m.rotation * (Math.PI / 2);
+  const modulModel = group.children[0];
+  if (modulModel) applyVisibilityToModel(modulModel, m);
+}
+
+// ---------------------------------------------------------------------------
 // Scene3D — Three.js 3D preview
 // ---------------------------------------------------------------------------
 
@@ -263,7 +426,7 @@ const GRASS_COLORS: Record<GrassType, number> = {
   dark:   0x232330,
 };
 
-function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingMode, clearAnnotationsRef, onAnnotationAdded, savedCameraRef, savedAnnotationsRef, onFillClick, exportSTLRef }: {
+function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingMode, clearAnnotationsRef, onAnnotationAdded, savedCameraRef, savedAnnotationsRef, onFillClick, exportSTLRef, onAllLoaded }: {
   modules: PlacedModule[];
   cols: number;
   rows: number;
@@ -276,6 +439,7 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
   savedAnnotationsRef: React.MutableRefObject<THREE.Mesh[]>;
   onFillClick: (mesh: THREE.Mesh, screenX: number, screenY: number) => void;
   exportSTLRef: React.MutableRefObject<(() => void) | null>;
+  onAllLoaded?: () => void;
 }) {
   const mountRef     = useRef<HTMLDivElement>(null);
   const rendererRef  = useRef<THREE.WebGLRenderer | null>(null);
@@ -294,10 +458,21 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
   const centerZRef   = useRef(0);
   const onFillClickRef = useRef(onFillClick);
   onFillClickRef.current = onFillClick;
+  const onAllLoadedRef = useRef(onAllLoaded);
+  onAllLoadedRef.current = onAllLoaded;
   const lightSettingsRef  = useRef(lightSettings);
   const sceneSettingsRef  = useRef(sceneSettings);
   lightSettingsRef.current = lightSettings;
   sceneSettingsRef.current = sceneSettings;
+  // Always-current ref so the [cols,rows] init effect can read latest modules
+  // without adding them to its dependency array.
+  const modulesRef      = useRef<PlacedModule[]>(modules);
+  modulesRef.current    = modules;
+  // Map of module id → Three.js Group currently in the scene.
+  const sceneModulesRef = useRef<Map<string, THREE.Group>>(new Map());
+  // Refs to the floor mesh/geometry so we can dispose them on teardown.
+  const floorRef        = useRef<THREE.Mesh | null>(null);
+  const floorGeoRef     = useRef<THREE.PlaneGeometry | null>(null);
 
   const applyLighting = useCallback((ls: LightSettings) => {
     const dirLight  = dirLightRef.current;
@@ -411,6 +586,10 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
 
   useEffect(() => {
     const mount = mountRef.current!;
+    // Capture sceneModulesRef.current at effect start so the cleanup function
+    // can reference the same Map without triggering the react-hooks/exhaustive-deps
+    // ref-in-cleanup warning.
+    const sceneModules = sceneModulesRef.current;
     // Read dimensions after mount; fall back to window size if the element
     // hasn't been laid-out yet (clientWidth/Height === 0).
     const w = mount.clientWidth  || window.innerWidth;
@@ -422,7 +601,7 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(w, h);
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.4;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -436,12 +615,13 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
 
     // Compute center from placed modules (or fall back to grid centre)
     let centerX: number, centerZ: number;
-    if (modules.length === 0) {
+    const currentModules = modulesRef.current; // read via ref — not a dep
+    if (currentModules.length === 0) {
       centerX = (cols / 2) * 2.4;
       centerZ = (rows / 2) * 2.4;
     } else {
       let minC = Infinity, minR = Infinity, maxC = -Infinity, maxR = -Infinity;
-      for (const m of modules) {
+      for (const m of currentModules) {
         const { w: mw2, h: mh2 } = moduleSize(m);
         if (m.col < minC) minC = m.col;
         if (m.row < minR) minR = m.row;
@@ -556,6 +736,8 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
     floor.position.set(centerX, 0, centerZ);
     floor.receiveShadow = true;
     scene.add(floor);
+    floorRef.current  = floor;
+    floorGeoRef.current = floorGeo;
     applyScene(sceneSettingsRef.current);
 
     // Grid lines — two helpers: one for day/outdoor, one for dark mode
@@ -576,147 +758,12 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
     gridHelperLight.visible = !initDark;
     gridHelperDark.visible  = initDark;
 
-    // Modules — rendered as GLB models only
-
-    // Custom GLB modules — loaded async via GLTFLoader
-    const customMeshes: THREE.Object3D[] = [];
-    if (modules.length > 0) {
-      const loader = new GLTFLoader();
-      modules.forEach(m => {
-        // ═══════════════════════════════════════════════════════════════
-        // UVEK UČITAVA large_full_modul.glb SA KONTROLOM VIDLJIVOSTI GRUPA
-        // ═══════════════════════════════════════════════════════════════
-        
-        const moduleGroup = new THREE.Group();
-        moduleGroup.name = `module-${m.id}`;
-        
-        // Fiksne dimenzije - zavisi od tipa modula
-        const FIXED_WIDTH = (m.type === 'large' || m.type === 'deck') ? 4.8 : 2.4;  // Large/Deck: 2 ćelije (4.8m), Small/Medium/SmallDeck: 1 ćelija (2.4m)
-        const FIXED_DEPTH = m.type === 'large' ? 2.4 : 2.4;  // Large: 1 ćelija (2.4m), Small: 1 ćelija (2.4m)
-        
-        // Izračunaj grid poziciju
-        const { w: gridW, h: gridH } = moduleSize(m);
-        const gridX = m.col * 2.4;
-        const gridZ = m.row * 2.4;
-        const footprintWidth = gridW * 2.4;
-        const footprintDepth = gridH * 2.4;
-        const footprintCenterX = gridX + footprintWidth / 2;
-        const footprintCenterZ = gridZ + footprintDepth / 2;
-        
-        // Učitaj GLB fajl (large_full.glb ili small_full.glb)
-        loader.load(`/modules/${m.glbFile}`, (gltf) => {
-          const modulModel = gltf.scene.clone();
-          modulModel.name = m.type === 'large' ? 'large-full' : m.type === 'deck' ? 'deck-full' : m.type === 'smalldeck' ? 'smalldeck-full' : m.type === 'medium' ? 'medium-full' : 'small-full';
-          
-          // Pronađi sve grupe po imenu (12 grupa)
-          const konstrukcijaGroup = modulModel.getObjectByName('konstrukcija');
-          const stakleniKrovGroup = modulModel.getObjectByName('stakleni_krov');
-          const fasada2PunZidGroup = modulModel.getObjectByName('fasada_2_pun_zid');
-          const fasada1SaVratimaGroup = modulModel.getObjectByName('fasada_1_sa_vratima');
-          const fasada1BezVrataGroup = modulModel.getObjectByName('fasada_1_bez_vrata');
-          const fasada4PodiznoKliznaGroup = modulModel.getObjectByName('fasada_4_podizno_klizniiiiiii');
-          const fasada4FixGroup = modulModel.getObjectByName('fasada_4_fix');
-          const fasada4KupatiloProzorGroup = modulModel.getObjectByName('fasada_4_kupatilo_prozor');
-          const fasada3ProzorSpavacaGroup = modulModel.getObjectByName('fasada_3_prozor_spavaca');
-          const fasada3PunZidGroup = modulModel.getObjectByName('fasada_3_pun_zid');
-          const krovPunGroup = modulModel.getObjectByName('krov_pun');
-          const fasada4PunZidGroup = modulModel.getObjectByName('fasada_4_pun_zid');
-          // Medium-specific groups (small_v2_full.glb)
-          const fasada1PodiznoKliznaGroup = modulModel.getObjectByName('fasada_1_podizno_klizniiiiiii');
-          const fasada1FixGroup = modulModel.getObjectByName('fasada_1_fix');
-          const fasada2PodiznoKliznaGroup = modulModel.getObjectByName('fasada_2_podizno_klizniiiiiii');
-          const fasada2FixGroup = modulModel.getObjectByName('fasada_2_fix');
-          const fasada3PodiznoKliznaGroup = modulModel.getObjectByName('fasada_3_podizno_klizniiiiiii');
-          const fasada3FixGroup = modulModel.getObjectByName('fasada_3_fix');
-          const fasada1PunZidGroup = modulModel.getObjectByName('fasada_1_pun_zid');
-          // Large _R groups (large_full_modul.glb — desna strana)
-          const fasada1SaVratimaRGroup = modulModel.getObjectByName('fasada_1_sa_vratima_R');
-          const fasada1BezVrataRGroup  = modulModel.getObjectByName('fasada_1_bez_vrata_R');
-          const fasada1PunZidRGroup    = modulModel.getObjectByName('fasada_1_pun_zid_R');
-          const fasada3ProzorSpavacaRGroup = modulModel.getObjectByName('fasada_3_prozor_spavaca_R');
-          const fasada3PunZidRGroup    = modulModel.getObjectByName('fasada_3_pun_zid_R');
-          // Deck-specific groups (large_full_large_deck.glb)
-          const terasaDeckOtkrivenaGroup = modulModel.getObjectByName('terasa_deck_otkrivena');
-          const terasaVelikaPergolaGroup = modulModel.getObjectByName('terasa_velika_pergola');
-          // SmallDeck-specific groups (large_full_small_deck.glb)
-          const terasaDeckMalaGroup = modulModel.getObjectByName('terasa_deck_mala');
-          const malaPergolaDesnagoreGroup = modulModel.getObjectByName('mala_pergola_desna_gore');
-          const malaPergolaLevaGoreGroup = modulModel.getObjectByName('mala_pergola_leva_gore');
-          
-          // Izmeri model
-          const bbox = new THREE.Box3().setFromObject(modulModel);
-          const originalSize = bbox.getSize(new THREE.Vector3());
-          
-          // Uniformno skaliranje - Small modul treba dodatno da se smanji jer je 1x1 umesto 2x1
-          const scaleX = FIXED_WIDTH / originalSize.x;
-          const scaleZ = FIXED_DEPTH / originalSize.z;
-          let uniformScale = Math.min(scaleX, scaleZ);
-          
-          modulModel.scale.set(uniformScale, uniformScale, uniformScale);
-          
-          // Update i izmeri
-          modulModel.updateMatrixWorld(true);
-          const bboxScaled = new THREE.Box3().setFromObject(modulModel);
-          const centerScaled = bboxScaled.getCenter(new THREE.Vector3());
-          
-          // Pozicioniranje u lokalnom koordinatnom sistemu grupe
-          modulModel.position.set(
-            -centerScaled.x,
-            -bboxScaled.min.y,  // Postavi na tlo
-            -centerScaled.z
-          );
-          
-          // Kontrola vidljivosti svih grupa (12 grupa)
-          if (konstrukcijaGroup) konstrukcijaGroup.visible = m.hasKonstrukcija;
-          if (stakleniKrovGroup) stakleniKrovGroup.visible = m.hasStakleniKrov;
-          if (fasada2PunZidGroup) fasada2PunZidGroup.visible = m.hasFasada2PunZid;
-          if (fasada1SaVratimaGroup) fasada1SaVratimaGroup.visible = m.hasFasada1SaVratima;
-          if (fasada1BezVrataGroup) fasada1BezVrataGroup.visible = m.hasFasada1BezVrata;
-          if (fasada4PodiznoKliznaGroup) fasada4PodiznoKliznaGroup.visible = m.hasFasada4PodiznoKlizna;
-          if (fasada4FixGroup) fasada4FixGroup.visible = m.hasFasada4Fix;
-          if (fasada4KupatiloProzorGroup) fasada4KupatiloProzorGroup.visible = m.hasFasada4KupatiloProzor;
-          if (fasada3ProzorSpavacaGroup) fasada3ProzorSpavacaGroup.visible = m.hasFasada3ProzorSpavaca;
-          if (fasada3PunZidGroup) fasada3PunZidGroup.visible = m.hasFasada3PunZid;
-          if (krovPunGroup) krovPunGroup.visible = m.hasKrovPun;
-          if (fasada4PunZidGroup) fasada4PunZidGroup.visible = m.hasFasada4PunZid;
-          if (fasada1PodiznoKliznaGroup) fasada1PodiznoKliznaGroup.visible = m.hasFasada1PodiznoKlizna;
-          if (fasada1FixGroup) fasada1FixGroup.visible = m.hasFasada1Fix;
-          if (fasada2PodiznoKliznaGroup) fasada2PodiznoKliznaGroup.visible = m.hasFasada2PodiznoKlizna;
-          if (fasada2FixGroup) fasada2FixGroup.visible = m.hasFasada2Fix;
-          if (fasada3PodiznoKliznaGroup) fasada3PodiznoKliznaGroup.visible = m.hasFasada3PodiznoKlizna;
-          if (fasada3FixGroup) fasada3FixGroup.visible = m.hasFasada3Fix;
-          if (fasada1PunZidGroup) fasada1PunZidGroup.visible = m.hasFasada1PunZid;
-          if (fasada1SaVratimaRGroup) fasada1SaVratimaRGroup.visible = m.hasFasada1SaVratimaR;
-          if (fasada1BezVrataRGroup)  fasada1BezVrataRGroup.visible  = m.hasFasada1BezVrataR;
-          if (fasada1PunZidRGroup)    fasada1PunZidRGroup.visible    = m.hasFasada1PunZidR;
-          if (fasada3ProzorSpavacaRGroup) fasada3ProzorSpavacaRGroup.visible = m.hasFasada3ProzorSpavacaR;
-          if (fasada3PunZidRGroup)    fasada3PunZidRGroup.visible    = m.hasFasada3PunZidR;
-          if (terasaDeckOtkrivenaGroup) terasaDeckOtkrivenaGroup.visible = m.hasTerasaDeckOtkrivena;
-          if (terasaVelikaPergolaGroup) terasaVelikaPergolaGroup.visible = m.hasTerasaVelikaPergola;
-          if (terasaDeckMalaGroup) terasaDeckMalaGroup.visible = m.hasTerasaDeckMala;
-          if (malaPergolaDesnagoreGroup) malaPergolaDesnagoreGroup.visible = m.hasMalaPergolaDesnagore;
-          if (malaPergolaLevaGoreGroup) malaPergolaLevaGoreGroup.visible = m.hasMalaPergolaLevaGore;
-          modulModel.traverse((child) => {
-            if ((child as THREE.Mesh).isMesh) {
-              child.castShadow = true;
-              child.receiveShadow = true;
-            }
-          });
-          
-          // Dodaj u grupu
-          moduleGroup.add(modulModel);
-        }, undefined, (err) => console.warn(`[${m.glbFile}] load error:`, err));
-        
-        // Rotiraj celu grupu
-        moduleGroup.rotation.y = -m.rotation * (Math.PI / 2);
-        
-        // Pozicioniraj celu grupu na grid
-        moduleGroup.position.set(footprintCenterX, 0, footprintCenterZ);
-        
-        // Dodaj grupu u scenu
-        scene.add(moduleGroup);
-        customMeshes.push(moduleGroup);
-      });
+    // Initial module placement — add all current modules via the shared helper.
+    // Subsequent adds/removals/visibility changes are handled by the
+    // [modules] diff effect below without triggering a scene rebuild.
+    sceneModules.clear();
+    for (const m of modulesRef.current) {
+      addModuleToScene(scene, m, sceneModules);
     }
 
     // OrbitControls — target the layout centre
@@ -770,7 +817,15 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
       observer.disconnect();
       controls.dispose();
       renderer.dispose();
-      customMeshes.forEach(obj => scene.remove(obj));
+      sceneModules.forEach((group) => {
+        scene.remove(group);
+        disposeObject3D(group);
+      });
+      sceneModules.clear();
+      if (floorRef.current) scene.remove(floorRef.current);
+      floorGeoRef.current?.dispose();
+      floorRef.current    = null;
+      floorGeoRef.current = null;
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       dirLightRef.current  = null;
       hemiLightRef.current = null;
@@ -783,8 +838,56 @@ function Scene3D({ modules, cols, rows, lightSettings, sceneSettings, isDrawingM
       rendererRef.current  = null;
       exportSTLRef.current = null;
     };
-  // Re-init when modules, cols, or rows change
-  }, [modules, cols, rows]);
+  // Re-init only when grid dimensions change (rare). Module changes are
+  // handled by the diff effect below without destroying the scene.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cols, rows]);
+
+  // ── Module diff update — runs on every modules change without scene rebuild
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    const current = sceneModulesRef.current;
+    const nextById = new Map(modules.map(m => [m.id, m]));
+
+    // Remove modules that are no longer in the layout
+    for (const [id, group] of current) {
+      if (!nextById.has(id)) {
+        scene.remove(group);
+        disposeObject3D(group);
+        current.delete(id);
+      }
+    }
+
+    // Count how many new modules will need an async GLB fetch (not yet cached).
+    // When all of them fire onLoaded, we call onAllLoaded once — but deferred
+    // by 2 rAF cycles so the animate() loop has rendered at least one complete
+    // frame with the new objects before the loading overlay disappears.
+    const signalDone = () =>
+      requestAnimationFrame(() => requestAnimationFrame(() => onAllLoadedRef.current?.()));
+
+    let pending = 0;
+    const onLoaded = () => {
+      pending--;
+      if (pending === 0) signalDone();
+    };
+
+    // Add new modules or update existing ones in-place
+    for (const m of modules) {
+      if (current.has(m.id)) {
+        // Cheap in-place update: position, rotation, visibility flags only
+        updateModuleInScene(current.get(m.id)!, m);
+      } else {
+        const isAsync = addModuleToScene(scene, m, current, onLoaded);
+        if (isAsync) pending++;
+      }
+    }
+
+    // If every new module was already cached, still defer by 2 frames so the
+    // renderer has drawn them before the overlay clears.
+    if (pending === 0) signalDone();
+  }, [modules]);
 
   // ── Drawing / annotation in 3D space ────────────────────────────────────
   useEffect(() => {
@@ -1222,6 +1325,7 @@ export default function Home() {
   const [drag,    setDrag]    = useState<DragState | null>(null);
   const [zoom,    setZoom]    = useState(1);
   const [view,    setView]    = useState<'2d' | '3d'>('2d');
+  const [glbLoading, setGlbLoading] = useState(false);
   const [lightSettings, setLightSettings] = useState<LightSettings>({ isDay: true, sunAngle: 63, sunElevation: 53 });
   const [sceneSettings, setSceneSettings] = useState<SceneSettings>({ grass: 'dark', fogEnabled: true });
   const [cols,    setCols]    = useState(DEFAULT_COLS);
@@ -1736,6 +1840,9 @@ export default function Home() {
   const loadFromHistory = (entry: HistoryEntry) => {
     setModules(entry.layout);
     setHistoryOpen(false);
+    // Show loading overlay — GLBs for the loaded layout aren't cached yet.
+    // The overlay clears when Scene3D fires onAllLoaded.
+    setGlbLoading(true);
   };
 
   const deleteFromHistory = async (id: string, e: React.MouseEvent) => {
@@ -2557,7 +2664,13 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
               }}
             >2D</button>
             <button
-              onClick={() => setView('3d')}
+              onClick={() => {
+                // Show loading overlay only if at least one module's GLB isn't
+                // in the cache yet (i.e. this is the first time seeing this layout in 3D).
+                const hasUncached = modules.some(m => !glbCache.has(`/modules/${m.glbFile}`));
+                if (hasUncached) setGlbLoading(true);
+                setView('3d');
+              }}
               style={{
                 padding: '4px 15px', borderRadius: 7, border: 'none',
                 background: view === '3d' ? 'rgba(255,255,255,0.12)' : 'transparent',
@@ -3020,7 +3133,23 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
       </div>
       ) : (
       <div style={{ position: 'relative', height: 'calc(100vh - 56px)' }}>
-        <Scene3D modules={modules} cols={cols} rows={rows} lightSettings={lightSettings} sceneSettings={sceneSettings} isDrawingMode={isDrawingMode} clearAnnotationsRef={clearAnnotationsRef} onAnnotationAdded={() => setHasAnnotations(true)} savedCameraRef={savedCameraRef} savedAnnotationsRef={savedAnnotationsRef} onFillClick={(mesh, x, y) => setFillPicker({ mesh, x, y })} exportSTLRef={exportSTLRef} />
+        <Scene3D modules={modules} cols={cols} rows={rows} lightSettings={lightSettings} sceneSettings={sceneSettings} isDrawingMode={isDrawingMode} clearAnnotationsRef={clearAnnotationsRef} onAnnotationAdded={() => setHasAnnotations(true)} savedCameraRef={savedCameraRef} savedAnnotationsRef={savedAnnotationsRef} onFillClick={(mesh, x, y) => setFillPicker({ mesh, x, y })} exportSTLRef={exportSTLRef} onAllLoaded={() => setGlbLoading(false)} />
+        {glbLoading && (
+          <div style={{
+            position: 'absolute', inset: 0, zIndex: 50,
+            background: 'rgba(11,13,20,0.72)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16,
+            pointerEvents: 'none',
+          }}>
+            <svg width="40" height="40" viewBox="0 0 40 40" fill="none" style={{ animation: 'spin 0.9s linear infinite' }}>
+              <circle cx="20" cy="20" r="16" stroke="rgba(255,255,255,0.12)" strokeWidth="4"/>
+              <path d="M20 4a16 16 0 0 1 16 16" stroke="rgba(255,255,255,0.85)" strokeWidth="4" strokeLinecap="round"/>
+            </svg>
+            <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: 13, fontWeight: 500, letterSpacing: '0.04em' }}>Učitavanje modela...</span>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          </div>
+        )}
         {fillPicker && (
           <div onClick={() => setFillPicker(null)} style={{ position: 'fixed', inset: 0, zIndex: 9998 }}>
             <div
@@ -3165,8 +3294,6 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                 writingMode: 'vertical-lr', direction: 'rtl',
                 width: 4, height: 80, cursor: 'pointer',
                 accentColor: lightSettings.isDay ? '#f59e0b' : '#3b82f6',
-                appearance: 'slider-vertical' as React.CSSProperties['appearance'],
-                WebkitAppearance: 'slider-vertical',
               }}
             />
             <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.18)', letterSpacing: '0.06em', textTransform: 'uppercase', writingMode: 'vertical-rl', transform: 'rotate(180deg)', userSelect: 'none' }}>J</span>
@@ -3182,8 +3309,6 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                 writingMode: 'vertical-lr', direction: 'rtl',
                 width: 4, height: 64, cursor: 'pointer',
                 accentColor: lightSettings.isDay ? '#f59e0b' : '#3b82f6',
-                appearance: 'slider-vertical' as React.CSSProperties['appearance'],
-                WebkitAppearance: 'slider-vertical',
               }}
             />
             <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.18)', letterSpacing: '0.06em', userSelect: 'none' }}>▼</span>
