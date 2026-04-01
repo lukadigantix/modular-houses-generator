@@ -1764,15 +1764,18 @@ export default function Home() {
   const [saveModalOpen, setSaveModalOpen] = useState(false);
   const [saveFormName,  setSaveFormName]  = useState('');
   const [saveFormNotes, setSaveFormNotes] = useState('');
+  // Tracks which history entry is currently loaded so we can offer overwrite.
+  const [activeHistoryEntry, setActiveHistoryEntry] = useState<HistoryEntry | null>(null);
 
   const openSaveModal = () => {
     if (modules.length === 0) return;
-    setSaveFormName('');
-    setSaveFormNotes('');
+    // Pre-fill with existing name/notes if we came from history
+    setSaveFormName(activeHistoryEntry?.name ?? '');
+    setSaveFormNotes(activeHistoryEntry?.notes ?? '');
     setSaveModalOpen(true);
   };
 
-  const handleSaveLayout = async () => {
+  const handleSaveLayout = async (mode: 'new' | 'overwrite' = 'new') => {
     if (modules.length === 0) return;
     setSaveStatus('saving');
     const { data: { user } } = await supabase.auth.getUser();
@@ -1784,8 +1787,7 @@ export default function Home() {
     const largeCount    = modules.filter(m => m.type === 'large').length;
     const smallCount    = modules.filter(m => m.type === 'small' || m.type === 'medium').length;
     const deckCount     = modules.filter(m => m.type === 'deck' || m.type === 'smalldeck').length;
-    const { error } = await supabase.from('layouts').insert({
-      user_id:       user.id,
+    const payload = {
       layout:        modules,
       name:          saveFormName.trim() || null,
       notes:         saveFormNotes.trim() || null,
@@ -1793,7 +1795,10 @@ export default function Home() {
       small_count:   smallCount,
       tall_count:    deckCount,
       total_area_m2: parseFloat(area.toFixed(2)),
-    });
+    };
+    const { error } = mode === 'overwrite' && activeHistoryEntry
+      ? await supabase.from('layouts').update(payload).eq('id', activeHistoryEntry.id)
+      : await supabase.from('layouts').insert({ ...payload, user_id: user.id });
     if (error) {
       setSaveStatus('error');
       setTimeout(() => setSaveStatus('idle'), 3000);
@@ -1839,6 +1844,7 @@ export default function Home() {
 
   const loadFromHistory = (entry: HistoryEntry) => {
     setModules(entry.layout);
+    setActiveHistoryEntry(entry);
     setHistoryOpen(false);
     // Show loading overlay — GLBs for the loaded layout aren't cached yet.
     // The overlay clears when Scene3D fires onAllLoaded.
@@ -2570,7 +2576,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
 
           {modules.length > 0 && (
             <button
-              onClick={() => setModules([])}
+              onClick={() => { setModules([]); setActiveHistoryEntry(null); }}
               style={{
                 background: 'transparent', border: '1px solid rgba(255,255,255,0.07)',
                 borderRadius: 8, padding: '6px 13px',
@@ -4715,21 +4721,29 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
         return (
           <div
             onClick={() => setSaveModalOpen(false)}
-            style={{ position: 'fixed', inset: 0, zIndex: 950, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            style={{ position: 'fixed', inset: 0, zIndex: 950, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center'}}
           >
             <div
               onClick={e => e.stopPropagation()}
               style={{
-                width: 400, background: 'rgba(12,14,26,0.98)', backdropFilter: 'blur(24px)',
+                width: 660, background: 'rgba(12,14,26,0.98)', backdropFilter: 'blur(24px)',
                 borderRadius: 16, border: '1px solid rgba(255,255,255,0.09)',
                 padding: '24px', display: 'flex', flexDirection: 'column', gap: 16,
                 fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif',
-                boxShadow: '0 24px 80px rgba(0,0,0,0.6)',
+                boxShadow: '0 24px 80px rgba(0,0,0,0.6)', 
               }}
+              
             >
               {/* Header */}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ color: '#fff', fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em' }}>Sačuvaj raspored</span>
+                <div>
+                  <span style={{ color: '#fff', fontSize: 15, fontWeight: 600, letterSpacing: '-0.01em' }}>Sačuvaj raspored</span>
+                  {activeHistoryEntry && (
+                    <div style={{ color: 'rgba(255,200,80,0.7)', fontSize: 11, fontWeight: 500, marginTop: 2 }}>
+                      Učitan iz istorije: <span style={{ color: 'rgba(255,200,80,0.9)' }}>{activeHistoryEntry.name ?? 'bez naziva'}</span>
+                    </div>
+                  )}
+                </div>
                 <button
                   onClick={() => setSaveModalOpen(false)}
                   style={{ width: 28, height: 28, borderRadius: '50%', border: 'none', background: 'rgba(255,255,255,0.07)', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
@@ -4808,8 +4822,22 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                   onClick={() => setSaveModalOpen(false)}
                   style={{ padding: '8px 16px', borderRadius: 9, border: '1px solid rgba(255,255,255,0.10)', background: 'transparent', color: 'rgba(255,255,255,0.5)', cursor: 'pointer', fontSize: 13, fontWeight: 500 }}
                 >Otkaži</button>
+                {activeHistoryEntry && (
+                  <button
+                    onClick={() => handleSaveLayout('overwrite')}
+                    disabled={saveStatus === 'saving'}
+                    style={{
+                      padding: '8px 18px', borderRadius: 9, border: '1px solid rgba(255,180,60,0.35)',
+                      background: 'rgba(255,160,30,0.12)', color: 'rgba(255,200,80,0.95)',
+                      cursor: saveStatus === 'saving' ? 'wait' : 'pointer',
+                      fontSize: 13, fontWeight: 600,
+                    }}
+                  >
+                    {saveStatus === 'saving' ? 'Čuvanje...' : 'Prepiši postojeći'}
+                  </button>
+                )}
                 <button
-                  onClick={handleSaveLayout}
+                  onClick={() => handleSaveLayout('new')}
                   disabled={saveStatus === 'saving'}
                   style={{
                     padding: '8px 20px', borderRadius: 9, border: 'none',
@@ -4818,7 +4846,7 @@ body{font-family:'Inter','Helvetica Neue',Arial,sans-serif;background:#f2f4f7;co
                     fontSize: 13, fontWeight: 600,
                   }}
                 >
-                  {saveStatus === 'saving' ? 'Čuvanje...' : 'Sačuvaj'}
+                  {saveStatus === 'saving' ? 'Čuvanje...' : activeHistoryEntry ? 'Sačuvaj kao novi' : 'Sačuvaj'}
                 </button>
               </div>
             </div>
